@@ -1,10 +1,12 @@
-{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE DeriveDataTypeable #-}
 {- Author: @ahmadsalim -}
 module SystemT where
 
 import Data.Maybe
+import Data.Data
+import Data.Typeable
 
-import Data.DeriveTH
+import Generic.Random.Data
 
 import Test.QuickCheck
 
@@ -14,9 +16,10 @@ infixr 2 :=>:
 data Type = NatTy
           | Type :*: Type
           | Type :=>: Type
-    deriving (Eq, Show)
+    deriving (Eq, Show, Data, Typeable)
 
-derive makeArbitrary ''Type
+instance Arbitrary Type where
+  arbitrary = sized generatorSR
 
 type Ctxt a = [a]
 
@@ -29,9 +32,10 @@ data Term = Var Int
           | Zero
           | Succ Term
           | Rec Term Term Term
-      deriving (Eq, Show)
+      deriving (Eq, Show, Data, Typeable)
 
-derive makeArbitrary ''Term
+instance Arbitrary Term where
+  arbitrary = sized generatorSR
 
 data Val = VFun Type (Val -> Maybe Val)
          | VProd Val Val
