@@ -1,4 +1,4 @@
-{-# LANGUAGE TupleSections #-}
+{-# LANGUAGE TupleSections, DeriveDataTypeable #-}
 {-
 Modifications by @ahmadsalim
 
@@ -12,10 +12,21 @@ module MicroKanren where
 
 import Data.List (transpose)
 import Data.Maybe (fromMaybe)
+
+import Data.Data
+import Data.Typeable
+
 import Control.Monad
 
+import Generic.Random.Data
+
+import Test.QuickCheck hiding ((===))
+
 data Term = UVar Int | Var Int | Atom String
-  deriving (Show, Eq)
+  deriving (Show, Eq, Data, Typeable)
+
+instance Arbitrary Term where
+  arbitrary = sized generatorSR
 
 data Statement =
     Fresh Statement
@@ -23,6 +34,10 @@ data Statement =
   | Statement :|: Statement
   | Term :=: Term
   | Call String [Term]
+  deriving (Show, Eq, Data, Typeable)
+
+instance Arbitrary Statement where
+  arbitrary = sized generatorSR
 
 data Definition = Definition {- Name -} String {- Parameters -} Int
 
@@ -73,6 +88,18 @@ interpretStatement ctxt (tm1 :=: tm2) =
   interpretTerm ctxt tm1 === interpretTerm ctxt tm2
 interpretStatement ctxt (Call stmt1 stmt2) = error "Call not supported"
 
+validTerm :: Int -> Term -> Bool
+validTerm _ct (UVar _t) = False
+validTerm ct  (Var x)   = 0 <= x && x < ct
+validTerm _ct (Atom _t) = True
+
+validStatement :: Int -> Statement -> Bool
+validStatement ct (Fresh st)     = validStatement (ct + 1) st
+validStatement ct (st1 :&: st2)  = validStatement ct st1 && validStatement ct st2
+validStatement ct (st1 :|: st2)  = validStatement ct st1 && validStatement ct st2
+validStatement ct (tm1 :=: tm2)  = validTerm ct tm1 && validTerm ct tm2
+validStatement ct (Call st1 st2) = False
+
 -- Examples
 
 emptyState :: (Substitution, Int)
@@ -96,3 +123,5 @@ mkTests = do
   print $ interpretStatement [] aAndB emptyState
   print $ take 4 $ fives (UVar 0) emptyState
   print $ take 6 $ fivesOrSixes emptyState
+
+prop_disj (st1, st2) = validStatement 0 st1 && validStatement 0 st2 ==> interpretStatement [] (st1 :|: st2) emptyState == interpretStatement [] (st2 :|: st1) emptyState
