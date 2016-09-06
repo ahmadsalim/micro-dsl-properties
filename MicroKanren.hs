@@ -124,4 +124,6 @@ mkTests = do
   print $ take 4 $ fives (UVar 0) emptyState
   print $ take 6 $ fivesOrSixes emptyState
 
-prop_disj (st1, st2) = validStatement 0 st1 && validStatement 0 st2 ==> interpretStatement [] (st1 :|: st2) emptyState == interpretStatement [] (st2 :|: st1) emptyState
+prop_disj (st1, st2) =
+  validStatement 0 st1 && validStatement 0 st2 ==>
+     interpretStatement [] (st1 :|: st2) emptyState == interpretStatement [] (st2 :|: st1) emptyState
