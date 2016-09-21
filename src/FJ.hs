@@ -201,3 +201,9 @@ animalProg = Prog [
         [Method (Name "Object") (Name "friend") [(Name "Animal", Name "other")]
                 (FieldAccess Nothing (Var Nothing (Name "other")) (Name "happiness"))]
   ]
+
+renameHappiness :: Prog
+renameHappiness =
+  let Just animalProgTyped    = checkTypes animalProg
+      Right animalProgRenamed = renameField animalProgTyped (Name "Animal") (Name "happiness") (Name "excitement")
+  in animalProgRenamed
