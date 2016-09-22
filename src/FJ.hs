@@ -16,6 +16,8 @@ import Control.Monad.Except
 
 import Text.PrettyPrint
 
+import Test.QuickCheck
+
 newtype Name = Name { unName :: String }
   deriving (Show, Eq, Data, Typeable)
 
@@ -61,6 +63,16 @@ data Expr = Var         { exprType :: Maybe ClassName, varName :: Name }
           | New         { exprType :: Maybe ClassName, newInstanceClassName :: ClassName, newInstanceArgs :: [Expr] }
           | Cast        { exprType :: Maybe ClassName, castClassName :: ClassName, castTarget :: Expr }
   deriving (Show, Eq, Data, Typeable)
+
+genExprScoped :: [(ClassName, Int)] -> [FieldName] -> [(MethodName, Int)] -> [Name] -> Int -> Gen Expr
+genExprScoped classes fields methods env = go
+  where go size = oneof $ [ Var Nothing <$> elements env | not (null env) ] ++
+                           [ FieldAccess Nothing <$> go (size - 1) <*> elements fields | not (null fields) && size > 0 ] ++
+                           [ do (m, argcount) <- elements methods
+                                MethodCall Nothing <$> go (size `div` (argcount + 1) ) <*> pure m <*> vectorOf argcount (go (size - 1)) | not (null methods) && size > 0 ] ++
+                           [ do (c, argcount) <- elements classes
+                                New Nothing <$> pure c <*> vectorOf argcount (go (size `div` (argcount + 1))) | not (null classes) && size > 0 ] ++
+                           [ Cast Nothing <$> (fst <$> elements classes) <*> go (size - 1) | not (null classes) && size > 0 ]
 
 infixr 6 :=>:
 
