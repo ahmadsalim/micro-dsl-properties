@@ -3,7 +3,6 @@
 {-# OPTIONS_GHC -fwarn-incomplete-patterns #-}
 module FJ where
 
-
 import Data.Data
 import Data.Typeable
 import Data.List
@@ -14,6 +13,8 @@ import Data.Generics.Uniplate.Data
 
 import Control.Monad
 import Control.Monad.Except
+
+import Text.PrettyPrint
 
 newtype Name = Name { unName :: String }
   deriving (Show, Eq, Data, Typeable)
@@ -169,6 +170,49 @@ typeExpression prog env (Cast Nothing tc e) = do
     else -} (tc, Cast (Just tc) tc e')
 typeExpression _prog _env _ = Nothing
 
+forgetTypeAnnotations :: Prog -> Prog
+forgetTypeAnnotations = transformBi (\(e :: Expr) -> e { exprType = Nothing })
+
+-- Pretty Printing
+
+prettyProg :: Prog -> Doc
+prettyProg = vcat . map prettyClass . classes
+
+prettyClass :: Class -> Doc
+prettyClass (Class cn sn fs ctor ms) =
+  text "class" <+> text (unName cn) <+> text "extends" <+> text (unName sn) <+> lbrace $+$
+  nest 2 (vcat (map prettyField fs ++ [prettyConstructor cn ctor fs] ++ map prettyMethod ms)) $+$
+  rbrace
+
+prettyField :: Field -> Doc
+prettyField (Field cn fn) = text (unName cn) <+> text (unName fn) <> semi
+
+prettyConstructor :: ClassName -> Constructor -> [Field] -> Doc
+prettyConstructor cn (Constructor args superargs) fs =
+     text (unName cn) <> parens (sep $ punctuate comma (map prettyArg args)) <+> lbrace $+$
+     nest 2 (vcat $ (text "super" <> parens (sep $ punctuate comma (map (text . unName . fieldName) superargs)) <> semi) :
+                    map prettyInitialize fs) $+$
+     rbrace
+  where prettyArg :: Field -> Doc
+        prettyArg (Field cn fn) = text (unName cn) <+> text (unName fn)
+        prettyInitialize :: Field -> Doc
+        prettyInitialize (Field cn fn) = text "this" <> text "." <> text (unName fn) <+> equals <+> text (unName fn) <> semi
+
+prettyMethod :: Method -> Doc
+prettyMethod (Method rty mnm pars body) =
+    text (unName rty) <+> text (unName mnm) <> parens (sep $ punctuate comma (map prettyPar pars)) <+> lbrace $+$
+    nest 2 (text "return" <+> prettyExpr body <> semi) $+$
+    rbrace
+  where prettyPar :: (ClassName, Name) -> Doc
+        prettyPar (cn, n) = text (unName cn) <+> text (unName n)
+
+prettyExpr :: Expr -> Doc
+prettyExpr (Var _ nm) = text (unName nm)
+prettyExpr (FieldAccess _ e f) = prettyExpr e <> text "." <> text (unName f)
+prettyExpr (MethodCall _ e0 m es) = prettyExpr e0 <> text "." <> text (unName m) <> parens (sep $ punctuate comma (map prettyExpr es))
+prettyExpr (New _ c es) = text "new" <+> text (unName c) <> parens (sep $ punctuate comma (map prettyExpr es))
+prettyExpr (Cast _ c e) = parens (text (unName c)) <> prettyExpr e
+
 -- Refactorings
 
 findClass :: (MonadError String m) => Prog -> ClassName -> m Class
@@ -195,7 +239,14 @@ renameField prog classnm oldfieldnm newfieldnm = do
                               oldField <- find ((== oldfieldnm) . fieldName) (fields c)
                               return c {
                                 fields = Field (fieldType oldField) newfieldnm :
-                                           delete oldField (fields c) }
+                                           delete oldField (fields c),
+                                constructor = (constructor c) {
+                                                 constructorArguments =
+                                                     map (\a -> if fieldName a == oldfieldnm
+                                                                then oldField { fieldName = newfieldnm }
+                                                                else a) $ constructorArguments (constructor c)
+                                                            }
+                                }
                             else Nothing) prog
   return $ rewriteBi (\(e :: Expr) ->
                         case e of
@@ -226,7 +277,7 @@ extractSuper prog class1nm class2nm newsupernm = do
   prevsuperfields <- fromMaybe (throwError $ "Can not find fields of " ++ unName prevsupernm)
                                (return <$> fieldsOf prog prevsupernm)
   let prog' = rewriteBi (\(c :: Class) ->
-                           if className c == class1nm || className c == class2nm
+                           if (className c == class1nm || className c == class2nm) && superclass c /= newsupernm
                            then
                              let newfields = fields c \\ commonFields
                                  newmethods = methods c \\ commonMethods
@@ -261,7 +312,7 @@ replaceDelegationWithInheritance prog classnm fieldnm = do
   ftymethods <- fromMaybe (throwError $ "Can not find methods of " ++ unName fty)
                           (return <$> methodsOf prog fty)
   let prog' = rewriteBi (\(c :: Class) ->
-                           if className c == classnm
+                           if className c == classnm && elem field (fields c)
                            then
                              let delegatedmethods = filter (\(m :: Method) ->
                                                         any ((== methodName m) . methodName) ftymethods &&
@@ -269,10 +320,12 @@ replaceDelegationWithInheritance prog classnm fieldnm = do
                                                             (MethodCall (Just _cm) (FieldAccess (Just _cf) (Var (Just _ct) (Name "this")) fn) mn es) ->
                                                               methodName m == mn && fieldnm == fn
                                                             _ -> False
-                                                      ) (universeBi c')
+                                                      ) (universeBi c)
+                                 newfields = delete field (fields c)
                                  c' = c {
                                       methods = methods c \\ delegatedmethods,
-                                      fields = delete field (fields c),
+                                      fields = newfields,
+                                      constructor = Constructor (ftyfields ++ newfields) ftyfields,
                                       superclass = fty }
                                  c'' = rewriteBi (\(e :: Expr) ->
                                              case e of
@@ -297,8 +350,48 @@ animalProg = Prog [
                 (FieldAccess Nothing (Var Nothing (Name "other")) (Name "happiness"))]
   ]
 
-renameHappiness :: Prog
-renameHappiness =
+renamedHappiness :: Prog
+renamedHappiness =
   let Just animalProgTyped    = checkTypes animalProg
       Right animalProgRenamed = renameField animalProgTyped (Name "Animal") (Name "happiness") (Name "excitement")
   in animalProgRenamed
+
+accountProg :: Prog
+accountProg = Prog [
+      Class (Name "SuperSavingsAccount") (Name "Object")
+            [Field (Name "Object") (Name "interest"),
+            Field (Name "Object") (Name "balance")]
+            (Constructor [Field (Name "Object") (Name "interest"),
+                          Field (Name "Object") (Name "balance")] [])
+            [Method (Name "SuperSavingsAccount") (Name "updateInterest") [(Name "Object", Name "newInterest")]
+                                                (New Nothing (Name "SuperSavingsAccount") [Var Nothing (Name "newInterest"),
+                                                                                            FieldAccess Nothing (Var Nothing (Name "this")) (Name "balance")])]
+    , Class (Name "BasicAccount") (Name "Object")
+            [Field (Name "Object") (Name "balance")]
+            (Constructor [Field (Name "Object") (Name "balance")] [])
+            []
+  ]
+
+extractAccountSuperProg :: Prog
+extractAccountSuperProg =
+  let Just accountProgTyped = checkTypes accountProg
+      Right accountProgSuperExtracted = extractSuper accountProgTyped (Name "SuperSavingsAccount") (Name "BasicAccount") (Name "Account")
+  in accountProgSuperExtracted
+
+teacherProg :: Prog
+teacherProg = Prog [
+   Class (Name "Person") (Name "Object") [Field (Name "Object") (Name "name")]
+         (Constructor [Field (Name "Object") (Name "name")] [])
+         [Method (Name "Object") (Name "getName") [] (FieldAccess Nothing (Var Nothing (Name "this")) (Name "name"))],
+   Class (Name "Teacher") (Name "Object") [Field (Name "Person") (Name "person")]
+         (Constructor [Field (Name "Person") (Name "person")] [])
+         [Method (Name "Object") (Name "getName") [] (MethodCall Nothing
+                                                                 (FieldAccess Nothing (Var Nothing (Name "this")) (Name "person"))
+                                                                 (Name "getName") [])]
+  ]
+
+teacherInheritanceProg :: Prog
+teacherInheritanceProg =
+  let Just teacherProgTyped = checkTypes teacherProg
+      Right teacherProgInheritance = replaceDelegationWithInheritance teacherProgTyped (Name "Teacher") (Name "person")
+  in teacherProgInheritance
