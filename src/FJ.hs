@@ -1,4 +1,5 @@
-{-# LANGUAGE DeriveDataTypeable, ScopedTypeVariables #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE DeriveDataTypeable, ScopedTypeVariables, FlexibleContexts #-}
 {-# OPTIONS_GHC -fwarn-incomplete-patterns #-}
 module FJ where
 
@@ -12,6 +13,7 @@ import Data.Tuple
 import Data.Generics.Uniplate.Data
 
 import Control.Monad
+import Control.Monad.Except
 
 newtype Name = Name { unName :: String }
   deriving (Show, Eq, Data, Typeable)
@@ -52,11 +54,11 @@ data Method = Method
               }
   deriving (Show, Eq, Data, Typeable)
 
-data Expr = Var         (Maybe ClassName) Name
-          | FieldAccess (Maybe ClassName) Expr      FieldName
-          | MethodCall  (Maybe ClassName) Expr      MethodName [Expr]
-          | New         (Maybe ClassName) ClassName [Expr]
-          | Cast        (Maybe ClassName) ClassName Expr
+data Expr = Var         { exprType :: Maybe ClassName, varName :: Name }
+          | FieldAccess { exprType :: Maybe ClassName, fieldAccessTarget :: Expr, fieldAccessName :: FieldName }
+          | MethodCall  { exprType :: Maybe ClassName, methodCallTarget :: Expr, methodCallName :: MethodName, methodCallArgs :: [Expr] }
+          | New         { exprType :: Maybe ClassName, newInstanceClassName :: ClassName, newInstanceArgs :: [Expr] }
+          | Cast        { exprType :: Maybe ClassName, castClassName :: ClassName, castTarget :: Expr }
   deriving (Show, Eq, Data, Typeable)
 
 infixr 6 :=>:
@@ -167,22 +169,33 @@ typeExpression prog env (Cast Nothing tc e) = do
     else -} (tc, Cast (Just tc) tc e')
 typeExpression _prog _env _ = Nothing
 
--- Refactorigns
+-- Refactorings
 
-renameField :: Prog -> ClassName -> FieldName -> FieldName -> Either String Prog
+findClass :: (MonadError String m) => Prog -> ClassName -> m Class
+findClass prog classnm =  fromMaybe (throwError $ "Unknown class: " ++ unName classnm)
+                                    (return <$> find ((== classnm) . className) (classes prog))
+
+
+renameFieldPrecondition :: (MonadError String m) => Prog -> ClassName -> FieldName -> FieldName -> m ()
+renameFieldPrecondition prog classnm oldfieldnm newfieldnm = do
+  class'      <- findClass prog classnm
+  unless (any ((== oldfieldnm) . fieldName) $ fields class') $
+        throwError ("Class " ++ unName classnm ++ "does not have field " ++ unName oldfieldnm)
+  when   (any (any ((== newfieldnm) . fieldName)) $ fieldsOf prog classnm) $
+        throwError ("Class " ++ unName classnm ++
+                  "or one of its superclasses already have field " ++ unName newfieldnm)
+
+
+renameField :: (MonadError String m) => Prog -> ClassName -> FieldName -> FieldName -> m Prog
 renameField prog classnm oldfieldnm newfieldnm = do
-  _ <- do
-    class'      <- fromMaybe (Left $ "Unknown class: " ++ unName classnm)
-                             (return <$> find ((== classnm) . className) (classes prog))
-    unless (any ((== oldfieldnm) . fieldName) $ fields class') $
-          Left ("Class " ++ unName classnm ++ "does not have field " ++ unName oldfieldnm)
-    when   (any (any ((== newfieldnm) . fieldName)) $ fieldsOf prog classnm) $
-          Left ("Class " ++ unName classnm ++ "or one of its superclasses already have field " ++ unName newfieldnm)
+  renameFieldPrecondition prog classnm oldfieldnm newfieldnm
   let prog' = rewriteBi (\(c :: Class) ->
                             if className c == classnm
                             then do
                               oldField <- find ((== oldfieldnm) . fieldName) (fields c)
-                              return c { fields = Field (fieldType oldField) newfieldnm : delete oldField (fields c) }
+                              return c {
+                                fields = Field (fieldType oldField) newfieldnm :
+                                           delete oldField (fields c) }
                             else Nothing) prog
   return $ rewriteBi (\(e :: Expr) ->
                         case e of
@@ -191,6 +204,88 @@ renameField prog classnm oldfieldnm newfieldnm = do
                             then return $ FieldAccess (Just c) e newfieldnm
                             else Nothing
                           _ -> Nothing) prog'
+
+
+extractSuperPrecondition :: (MonadError String m) =>  Prog -> ClassName -> ClassName -> ClassName -> m (Class, Class)
+extractSuperPrecondition prog class1nm class2nm newsupernm = do
+  class1 <- findClass prog class1nm
+  class2 <- findClass prog class2nm
+  unless (superclass class1 == superclass class2) $
+    throwError $ "The provided classes " ++ unName class1nm ++ " and " ++
+                   unName class2nm ++ " do not have the same supertype"
+  when (any ((== newsupernm) . className) (classes prog)) $
+    throwError $ "Target superclass name, " ++ unName newsupernm ++ " is already in use"
+  return (class1, class2)
+
+extractSuper :: (MonadError String m) => Prog -> ClassName -> ClassName -> ClassName -> m Prog
+extractSuper prog class1nm class2nm newsupernm = do
+  (class1, class2) <- extractSuperPrecondition prog class1nm class2nm newsupernm
+  let commonFields  = fields class1 `intersect` fields class2
+  let commonMethods = methods class1 `intersect` methods class2
+  let prevsupernm     = superclass class1
+  prevsuperfields <- fromMaybe (throwError $ "Can not find fields of " ++ unName prevsupernm)
+                               (return <$> fieldsOf prog prevsupernm)
+  let prog' = rewriteBi (\(c :: Class) ->
+                           if className c == class1nm || className c == class2nm
+                           then
+                             let newfields = fields c \\ commonFields
+                                 newmethods = methods c \\ commonMethods
+                                 newsuperfields = prevsuperfields ++ commonFields
+                             in return c {
+                                  fields = newfields,
+                                  methods = newmethods,
+                                  constructor = Constructor (newsuperfields ++ newfields) newsuperfields,
+                                  superclass = newsupernm }
+                           else Nothing) prog
+  let prog'' = prog' { classes = Class newsupernm prevsupernm commonFields
+                                       (Constructor (prevsuperfields ++ commonFields) prevsuperfields) commonMethods :
+                                         classes prog' }
+  -- TODO Extend extract superclass to handle generalization of function parameters and other local variables where possible
+  return prog''
+
+replaceDelegationWithInheritancePrecondition :: (MonadError String m) => Prog -> ClassName -> FieldName -> m (Class, Field)
+replaceDelegationWithInheritancePrecondition prog classnm fieldnm = do
+  class' <- findClass prog classnm
+  unless (superclass class' == Name "Object") $
+    throwError $ "Class " ++ unName classnm ++ " already has a superclass " ++ unName (superclass class')
+  field <- fromMaybe (throwError $ "Class " ++ unName classnm ++ " does not contain field " ++ unName fieldnm)
+                     (return <$> find ((== fieldnm) . fieldName) (fields class'))
+  return (class', field)
+
+replaceDelegationWithInheritance :: (MonadError String m) => Prog -> ClassName -> FieldName -> m Prog
+replaceDelegationWithInheritance prog classnm fieldnm = do
+  (class', field) <- replaceDelegationWithInheritancePrecondition prog classnm fieldnm
+  let fty = fieldType field
+  ftyfields  <- fromMaybe (throwError $ "Can not find fields of " ++ unName fty)
+                          (return <$> fieldsOf prog fty)
+  ftymethods <- fromMaybe (throwError $ "Can not find methods of " ++ unName fty)
+                          (return <$> methodsOf prog fty)
+  let prog' = rewriteBi (\(c :: Class) ->
+                           if className c == classnm
+                           then
+                             let delegatedmethods = filter (\(m :: Method) ->
+                                                        any ((== methodName m) . methodName) ftymethods &&
+                                                          case methodBodyExpr m of
+                                                            (MethodCall (Just _cm) (FieldAccess (Just _cf) (Var (Just _ct) (Name "this")) fn) mn es) ->
+                                                              methodName m == mn && fieldnm == fn
+                                                            _ -> False
+                                                      ) (universeBi c')
+                                 c' = c {
+                                      methods = methods c \\ delegatedmethods,
+                                      fields = delete field (fields c),
+                                      superclass = fty }
+                                 c'' = rewriteBi (\(e :: Expr) ->
+                                             case e of
+                                               FieldAccess (Just _cf) v@(Var (Just _ct) (Name "this")) fn | fieldnm == fn -> return v
+                                               _ -> Nothing) c'
+                             in return c''
+                           else Nothing) prog
+  let prog'' = rewriteBi (\(e :: Expr) ->
+                            case e of
+                              FieldAccess (Just _tc) e fn
+                                | Just ety <- exprType e, isSubtype prog' ety classnm && fieldnm == fn -> return e
+                              _ -> Nothing) prog'
+  return prog''
 
 -- Example Programs
 
