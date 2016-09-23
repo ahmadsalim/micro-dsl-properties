@@ -1,4 +1,3 @@
-{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE DeriveDataTypeable, ScopedTypeVariables, FlexibleContexts #-}
 {-# OPTIONS_GHC -fwarn-incomplete-patterns #-}
 module FJ where
@@ -75,7 +74,9 @@ unique xs = nub xs == xs
 newtype Readable = Readable { getReadable :: String }
 
 instance Arbitrary Readable where
-  arbitrary = Readable <$> listOf1 (elements (['A' .. 'Z'] ++ ['a'..'z']))
+  arbitrary = do
+    len <- getSmall . getPositive <$> arbitrary
+    Readable <$> vectorOf len (elements (['A' .. 'Z'] ++ ['a'..'z']))
 
 genProgram :: Int -> Gen Prog
 genProgram size = do
@@ -87,12 +88,15 @@ genProgram size = do
   foldlM (\prevProg ci -> (\c -> prevProg { classes = c : classes prevProg }) <$> genClassScoped prevProg cs' ci (size `div` length cs'))
          (Prog []) [0 .. length cs' - 1]
 
+instance Arbitrary Prog where
+  arbitrary = sized genProgram
+
 genClassP1Scoped :: [(ClassName, [FieldName], [(MethodName, Int)], Maybe ClassName)] -> ClassName -> Int -> Gen (ClassName, [FieldName], [(MethodName, Int)], ClassName)
 genClassP1Scoped prevClasses cn size = do
   (super, superfs, superms, _) <- elements prevClasses
   (,,,) <$> pure cn
-        <*> ((superfs ++) <$> (nub . take size <$> listOf (Name . getReadable <$> arbitrary)))
-        <*> ((superms ++) <$> (nub . take size <$> listOf ((,) <$> (Name . getReadable <$> arbitrary) <*> (getSmall . getPositive <$> arbitrary))))
+        <*> ((superfs ++) <$> (nub . take (size `div` 2) <$> listOf (Name . getReadable <$> arbitrary)))
+        <*> ((superms ++) <$> (nub . take (size `div` 2) <$> listOf ((,) <$> (Name . getReadable <$> arbitrary) <*> (getSmall . getPositive <$> arbitrary))))
         <*> pure super
 
 genClassScoped :: Prog -> [(ClassName, [FieldName], [(MethodName, Int)], ClassName)] -> Int -> Int -> Gen Class
