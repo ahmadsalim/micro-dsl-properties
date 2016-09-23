@@ -8,6 +8,7 @@ import Data.Typeable
 import Data.List
 import Data.Maybe
 import Data.Tuple
+import Data.Foldable
 
 import Data.Generics.Uniplate.Data
 
@@ -26,7 +27,10 @@ type FieldName  = Name
 type MethodName = Name
 
 newtype Prog = Prog { classes :: [Class] }
-  deriving (Show, Eq, Data, Typeable)
+  deriving (Eq, Data, Typeable)
+
+instance Show Prog where
+  show = render . prettyProg
 
 data Class = Class
             { className :: Name
@@ -64,6 +68,55 @@ data Expr = Var         { exprType :: Maybe ClassName, varName :: Name }
           | Cast        { exprType :: Maybe ClassName, castClassName :: ClassName, castTarget :: Expr }
   deriving (Show, Eq, Data, Typeable)
 
+-- Generators
+unique :: Eq a => [a] -> Bool
+unique xs = nub xs == xs
+
+newtype Readable = Readable { getReadable :: String }
+
+instance Arbitrary Readable where
+  arbitrary = Readable <$> listOf1 (elements (['A' .. 'Z'] ++ ['a'..'z']))
+
+genProgram :: Int -> Gen Prog
+genProgram size = do
+  cnames <- nub <$> listOf (Name . getReadable <$> arbitrary)
+  _objc : cs <- reverse <$> foldrM (\cn gp1 -> (: gp1) <$>
+                                ((\(c,fs,ms,sp) -> (c,fs,ms,Just sp)) <$> genClassP1Scoped gp1 cn))
+                                 [(Name "Object", [], [], Nothing)] cnames
+  let cs' = map (\(c,fs,ms,Just sp) -> (c,fs,ms,sp)) cs
+  foldlM (\prevProg ci -> (\c -> prevProg { classes = c : classes prevProg }) <$> genClassScoped prevProg cs' ci (size - length cs'))
+         (Prog []) [0 .. length cs' - 1]
+
+genClassP1Scoped :: [(ClassName, [FieldName], [(MethodName, Int)], Maybe ClassName)] -> ClassName -> Gen (ClassName, [FieldName], [(MethodName, Int)], ClassName)
+genClassP1Scoped prevClasses cn = do
+  (super, superfs, superms, _) <- elements prevClasses
+  (,,,) <$> pure cn
+        <*> ((superfs ++) <$> (nub <$> listOf (Name . getReadable <$> arbitrary)))
+        <*> ((superms ++) <$> (nub <$> listOf ((,) <$> (Name . getReadable <$> arbitrary) <*> (getSmall . getPositive <$> arbitrary))))
+        <*> pure super
+
+genClassScoped :: Prog -> [(ClassName, [FieldName], [(MethodName, Int)], ClassName)] -> Int -> Int -> Gen Class
+genClassScoped prevProg classes index size = do
+  let (cn, fs, ms, sn) = classes !! index
+  let Just sfvals = fieldsOf prevProg sn
+  let allcs = map (\(c,fs,_,_) -> (c, length fs)) classes
+  let allfs = concatMap (\(_,fs,_,_) -> fs) classes
+  let allms = concatMap (\(_,_,ms,_) -> ms) classes
+  let specificfs = fs \\ map fieldName sfvals
+  fieldvals <- mapM (genFieldScoped (map (\(c,_,_,_) -> c) classes)) specificfs
+  Class cn sn fieldvals (Constructor (sfvals ++ fieldvals) sfvals) <$>
+    mapM (\m -> genMethodScoped allcs allfs allms m (size - (length fs - length ms))) ms
+
+genFieldScoped :: [ClassName] -> FieldName -> Gen Field
+genFieldScoped classes fn = Field <$> elements classes <*> pure fn
+
+genMethodScoped :: [(ClassName, Int)] -> [FieldName] -> [(MethodName, Int)] -> (MethodName, Int) -> Int -> Gen Method
+genMethodScoped classes fields methods (methodnm, argcount) size = do
+    params <- zip <$> vectorOf argcount (fst <$> elements classes)
+                  <*> (vectorOf argcount (Name . getReadable <$> arbitrary) `suchThat` unique)
+    Method <$> (fst <$> elements classes) <*> pure methodnm <*> pure params
+           <*> genExprScoped classes fields methods (map snd params ++ [Name "this"]) (size - 1)
+
 genExprScoped :: [(ClassName, Int)] -> [FieldName] -> [(MethodName, Int)] -> [Name] -> Int -> Gen Expr
 genExprScoped classes fields methods env = go
   where go size = oneof $ [ Var Nothing <$> elements env | not (null env) ] ++
@@ -74,10 +127,13 @@ genExprScoped classes fields methods env = go
                                 New Nothing <$> pure c <*> vectorOf argcount (go (size `div` (argcount + 1))) | not (null classes) && size > 0 ] ++
                            [ Cast Nothing <$> (fst <$> elements classes) <*> go (size - 1) | not (null classes) && size > 0 ]
 
+-- Checking
+
 infixr 6 :=>:
 
 data MethodType = [ClassName] :=>: ClassName
   deriving (Show, Eq)
+
 
 isSubtype :: Prog -> ClassName -> ClassName -> Bool
 isSubtype _prog cn cn' | cn == cn' = True
