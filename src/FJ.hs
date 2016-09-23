@@ -79,20 +79,20 @@ instance Arbitrary Readable where
 
 genProgram :: Int -> Gen Prog
 genProgram size = do
-  cnames <- nub <$> listOf (Name . getReadable <$> arbitrary)
+  cnames <- nub . take (size `div` 2) <$> listOf1 (Name . getReadable <$> arbitrary)
   _objc : cs <- reverse <$> foldrM (\cn gp1 -> (: gp1) <$>
-                                ((\(c,fs,ms,sp) -> (c,fs,ms,Just sp)) <$> genClassP1Scoped gp1 cn))
+                                ((\(c,fs,ms,sp) -> (c,fs,ms,Just sp)) <$> genClassP1Scoped gp1 cn (size `div` length cnames)))
                                  [(Name "Object", [], [], Nothing)] cnames
   let cs' = map (\(c,fs,ms,Just sp) -> (c,fs,ms,sp)) cs
-  foldlM (\prevProg ci -> (\c -> prevProg { classes = c : classes prevProg }) <$> genClassScoped prevProg cs' ci (size - length cs'))
+  foldlM (\prevProg ci -> (\c -> prevProg { classes = c : classes prevProg }) <$> genClassScoped prevProg cs' ci (size `div` length cs'))
          (Prog []) [0 .. length cs' - 1]
 
-genClassP1Scoped :: [(ClassName, [FieldName], [(MethodName, Int)], Maybe ClassName)] -> ClassName -> Gen (ClassName, [FieldName], [(MethodName, Int)], ClassName)
-genClassP1Scoped prevClasses cn = do
+genClassP1Scoped :: [(ClassName, [FieldName], [(MethodName, Int)], Maybe ClassName)] -> ClassName -> Int -> Gen (ClassName, [FieldName], [(MethodName, Int)], ClassName)
+genClassP1Scoped prevClasses cn size = do
   (super, superfs, superms, _) <- elements prevClasses
   (,,,) <$> pure cn
-        <*> ((superfs ++) <$> (nub <$> listOf (Name . getReadable <$> arbitrary)))
-        <*> ((superms ++) <$> (nub <$> listOf ((,) <$> (Name . getReadable <$> arbitrary) <*> (getSmall . getPositive <$> arbitrary))))
+        <*> ((superfs ++) <$> (nub . take size <$> listOf (Name . getReadable <$> arbitrary)))
+        <*> ((superms ++) <$> (nub . take size <$> listOf ((,) <$> (Name . getReadable <$> arbitrary) <*> (getSmall . getPositive <$> arbitrary))))
         <*> pure super
 
 genClassScoped :: Prog -> [(ClassName, [FieldName], [(MethodName, Int)], ClassName)] -> Int -> Int -> Gen Class
@@ -105,7 +105,7 @@ genClassScoped prevProg classes index size = do
   let specificfs = fs \\ map fieldName sfvals
   fieldvals <- mapM (genFieldScoped (map (\(c,_,_,_) -> c) classes)) specificfs
   Class cn sn fieldvals (Constructor (sfvals ++ fieldvals) sfvals) <$>
-    mapM (\m -> genMethodScoped allcs allfs allms m (size - (length fs - length ms))) ms
+    mapM (\m -> genMethodScoped allcs allfs allms m ((size - length fs) `div` length ms)) ms
 
 genFieldScoped :: [ClassName] -> FieldName -> Gen Field
 genFieldScoped classes fn = Field <$> elements classes <*> pure fn
@@ -115,7 +115,7 @@ genMethodScoped classes fields methods (methodnm, argcount) size = do
     params <- zip <$> vectorOf argcount (fst <$> elements classes)
                   <*> (vectorOf argcount (Name . getReadable <$> arbitrary) `suchThat` unique)
     Method <$> (fst <$> elements classes) <*> pure methodnm <*> pure params
-           <*> genExprScoped classes fields methods (map snd params ++ [Name "this"]) (size - 1)
+           <*> genExprScoped classes fields methods (map snd params ++ [Name "this"]) size
 
 genExprScoped :: [(ClassName, Int)] -> [FieldName] -> [(MethodName, Int)] -> [Name] -> Int -> Gen Expr
 genExprScoped classes fields methods env = go
@@ -178,14 +178,13 @@ checkMethodScope :: Prog -> Method -> Bool
 checkMethodScope prog (Method _rty _mnm pars mbody) = checkExpressionScope prog (map snd pars ++ [Name "this"]) mbody
 
 checkExpressionScope :: Prog -> [Name] -> Expr -> Bool
-checkExpressionScope _prog env (Var Nothing nm)            = nm `elem` env
-checkExpressionScope prog env (FieldAccess Nothing e f)   =
-  checkExpressionScope prog env e && any (any (any ((== f) . fieldName)) . fieldsOf prog . className) (classes prog)
+checkExpressionScope _prog env (Var Nothing nm)           = nm `elem` env
+checkExpressionScope prog env (FieldAccess Nothing e f)   = checkExpressionScope prog env e && any (any (any ((== f) . fieldName)) . fieldsOf prog . className) (classes prog)
 checkExpressionScope prog env (MethodCall Nothing e m es) =
    checkExpressionScope prog env e &&
    any (any (any (\m' -> length (methodParameters m') == length es && ((== m) . methodName $ m'))) . methodsOf prog . className) (classes prog) &&
    all (checkExpressionScope prog env) es
-checkExpressionScope prog env (New Nothing c es)          = length (fieldsOf prog c) == length es && all (checkExpressionScope prog env) es
+checkExpressionScope prog env (New Nothing c es)          = length (fromJust $ fieldsOf prog c) == length es && all (checkExpressionScope prog env) es
 checkExpressionScope prog env (Cast Nothing _c e)         = checkExpressionScope prog env e
 checkExpressionScope prog env _                           = False
 
