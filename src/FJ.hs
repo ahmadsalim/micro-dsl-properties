@@ -80,7 +80,7 @@ instance Arbitrary Readable where
 
 genProgram :: Int -> Gen Prog
 genProgram size = do
-  cnames <- nub . take (size `div` 2) <$> listOf1 (Name . getReadable <$> arbitrary)
+  cnames <- nub <$> resize (size `div` 2) (listOf1 (Name . getReadable <$> arbitrary))
   _objc : cs <- reverse <$> foldrM (\cn gp1 -> (: gp1) <$>
                                 ((\(c,fs,ms,sp) -> (c,fs,ms,Just sp)) <$> genClassP1Scoped gp1 cn (size `div` length cnames)))
                                  [(Name "Object", [], [], Nothing)] cnames
@@ -95,8 +95,8 @@ genClassP1Scoped :: [(ClassName, [FieldName], [(MethodName, Int)], Maybe ClassNa
 genClassP1Scoped prevClasses cn size = do
   (super, superfs, superms, _) <- elements prevClasses
   (,,,) <$> pure cn
-        <*> ((superfs ++) <$> (nub . take (size `div` 2) <$> listOf (Name . getReadable <$> arbitrary)))
-        <*> ((superms ++) <$> (nub . take (size `div` 2) <$> listOf ((,) <$> (Name . getReadable <$> arbitrary) <*> (getSmall . getPositive <$> arbitrary))))
+        <*> ((superfs ++) <$> (nub <$> resize (size `div` 2) (listOf (Name . getReadable <$> arbitrary))))
+        <*> ((superms ++) <$> (nub <$> resize (size `div` 2) (listOf ((,) <$> (Name . getReadable <$> arbitrary) <*> (getSmall . getPositive <$> arbitrary)))))
         <*> pure super
 
 genClassScoped :: Prog -> [(ClassName, [FieldName], [(MethodName, Int)], ClassName)] -> Int -> Int -> Gen Class
