@@ -1,15 +1,17 @@
-{-# LANGUAGE DeriveDataTypeable, ScopedTypeVariables, FlexibleContexts #-}
+{-# LANGUAGE ScopedTypeVariables, MultiParamTypeClasses, FlexibleContexts #-}
 {-# OPTIONS_GHC -fwarn-incomplete-patterns #-}
+{-# OPTIONS_GHC -F -pgmFderive -optF-F #-}
 module FJ where
 
 import Data.Data
 import Data.Typeable
 import Data.List
 import Data.Maybe
+import Data.Either
 import Data.Tuple
 import Data.Foldable
 
-import Data.Generics.Uniplate.Data
+import Data.Generics.Uniplate.Direct
 
 import Control.Monad
 import Control.Monad.Except
@@ -19,14 +21,14 @@ import Text.PrettyPrint
 import Test.QuickCheck
 
 newtype Name = Name { unName :: String }
-  deriving (Show, Eq, Data, Typeable)
+  deriving (Show, Eq)
 
 type ClassName  = Name
 type FieldName  = Name
 type MethodName = Name
 
 newtype Prog = Prog { classes :: [Class] }
-  deriving (Eq, Data, Typeable)
+  deriving Eq
 
 instance Show Prog where
   show = render . prettyProg
@@ -38,19 +40,19 @@ data Class = Class
             , constructor :: Constructor
             , methods :: [Method]
             }
-   deriving (Show, Eq, Data, Typeable)
+   deriving (Show, Eq)
 
 data Field = Field
              { fieldType :: ClassName
              , fieldName  :: Name
              }
-  deriving (Show, Eq, Data, Typeable)
+  deriving (Show, Eq)
 
 data Constructor = Constructor
                    { constructorArguments       :: [Field]
                    , constructorSuperArguments  :: [Field]
                    }
-  deriving (Show, Eq, Data, Typeable)
+  deriving (Show, Eq)
 
 data Method = Method
               { methodReturnType :: ClassName
@@ -58,14 +60,30 @@ data Method = Method
               , methodParameters :: [(ClassName, Name)]
               , methodBodyExpr   :: Expr
               }
-  deriving (Show, Eq, Data, Typeable)
+  deriving (Show, Eq)
 
 data Expr = Var         { exprType :: Maybe ClassName, varName :: Name }
           | FieldAccess { exprType :: Maybe ClassName, fieldAccessTarget :: Expr, fieldAccessName :: FieldName }
           | MethodCall  { exprType :: Maybe ClassName, methodCallTarget :: Expr, methodCallName :: MethodName, methodCallArgs :: [Expr] }
           | New         { exprType :: Maybe ClassName, newInstanceClassName :: ClassName, newInstanceArgs :: [Expr] }
           | Cast        { exprType :: Maybe ClassName, castClassName :: ClassName, castTarget :: Expr }
-  deriving (Show, Eq, Data, Typeable)
+  deriving (Show, Eq)
+
+{-!
+deriving instance UniplateDirect Prog   Class
+deriving instance UniplateDirect Prog   Expr
+deriving instance UniplateDirect Prog
+deriving instance UniplateDirect Constructor Field
+deriving instance UniplateDirect Constructor
+deriving instance UniplateDirect Class
+deriving instance UniplateDirect Class  Expr
+deriving instance UniplateDirect Class  Field
+deriving instance UniplateDirect Field
+deriving instance UniplateDirect Class  Method
+deriving instance UniplateDirect Method
+deriving instance UniplateDirect Method Expr
+deriving instance UniplateDirect Expr
+!-}
 
 -- Generators
 unique :: Eq a => [a] -> Bool
@@ -75,12 +93,12 @@ newtype Readable = Readable { getReadable :: String }
 
 instance Arbitrary Readable where
   arbitrary = do
-    len <- getSmall . getPositive <$> arbitrary
+    len <- (getSmall . getPositive) <$> arbitrary
     Readable <$> vectorOf len (elements (['A' .. 'Z'] ++ ['a'..'z']))
 
 genProgram :: Int -> Gen Prog
 genProgram size = do
-  cnames <- nub <$> resize (size `div` 2) (listOf1 (Name . getReadable <$> arbitrary))
+  cnames <- nub <$> resize (size `div` 2) (listOf1 ((Name . getReadable) <$> arbitrary))
   _objc : cs <- reverse <$> foldrM (\cn gp1 -> (: gp1) <$>
                                 ((\(c,fs,ms,sp) -> (c,fs,ms,Just sp)) <$> genClassP1Scoped gp1 cn (size `div` length cnames)))
                                  [(Name "Object", [], [], Nothing)] cnames
@@ -95,8 +113,8 @@ genClassP1Scoped :: [(ClassName, [FieldName], [(MethodName, Int)], Maybe ClassNa
 genClassP1Scoped prevClasses cn size = do
   (super, superfs, superms, _) <- elements prevClasses
   (,,,) <$> pure cn
-        <*> ((superfs ++) <$> (nub <$> resize (size `div` 2) (listOf (Name . getReadable <$> arbitrary))))
-        <*> ((superms ++) <$> (nub <$> resize (size `div` 2) (listOf ((,) <$> (Name . getReadable <$> arbitrary) <*> (getSmall . getPositive <$> arbitrary)))))
+        <*> ((superfs ++) <$> (nub <$> resize (size `div` 2) (listOf ((Name . getReadable) <$> arbitrary))))
+        <*> ((superms ++) <$> (nub <$> resize (size `div` 2) (listOf ((,) <$> ((Name . getReadable) <$> arbitrary) <*> ((getSmall . getPositive) <$> arbitrary)))))
         <*> pure super
 
 genClassScoped :: Prog -> [(ClassName, [FieldName], [(MethodName, Int)], ClassName)] -> Int -> Int -> Gen Class
@@ -117,7 +135,7 @@ genFieldScoped classes fn = Field <$> elements classes <*> pure fn
 genMethodScoped :: [(ClassName, Int)] -> [FieldName] -> [(MethodName, Int)] -> (MethodName, Int) -> Int -> Gen Method
 genMethodScoped classes fields methods (methodnm, argcount) size = do
     params <- zip <$> vectorOf argcount (fst <$> elements classes)
-                  <*> (vectorOf argcount (Name . getReadable <$> arbitrary) `suchThat` unique)
+                  <*> (vectorOf argcount ((Name . getReadable) <$> arbitrary) `suchThat` unique)
     Method <$> (fst <$> elements classes) <*> pure methodnm <*> pure params
            <*> genExprScoped classes fields methods (map snd params ++ [Name "this"]) size
 
@@ -138,24 +156,45 @@ infixr 6 :=>:
 data MethodType = [ClassName] :=>: ClassName
   deriving (Show, Eq)
 
+isWellformed :: Prog -> Bool
+isWellformed prog = all (isWellformedClass prog . className) (classes prog)
+
+isWellformedClass :: Prog -> ClassName -> Bool
+isWellformedClass _prog (Name "Object") = True
+isWellformedClass prog cn           = any (tryReach . superclass) (findClass prog cn :: Either String Class)
+  where tryReach (Name "Object") = True
+        tryReach cn' | cn == cn' = False
+        tryReach cn' =  any (tryReach . superclass) (findClass prog cn' :: Either String Class)
+
+isSubtype' :: Int -> Prog -> ClassName -> ClassName -> Bool
+isSubtype' fuel _prog cn cn' | cn == cn' = True
+isSubtype' fuel prog cn cn'  | fuel > 0 =
+  fromMaybe False (do c <- find ((== cn) . className) (classes prog)
+                      return $ isSubtype' (fuel - 1) prog (superclass c) cn')
+isSubtype' _fuel _prog _cn _cn' = False
 
 isSubtype :: Prog -> ClassName -> ClassName -> Bool
-isSubtype _prog cn cn' | cn == cn' = True
-isSubtype prog cn cn' =
-  fromMaybe False (do c <- find ((== cn) . className) (classes prog)
-                      return $ isSubtype prog (superclass c) cn')
+isSubtype p = isSubtype' (length . classes $ p) p
 
-fieldsOf :: Prog -> Name -> Maybe [Field]
-fieldsOf _prog (Name "Object") = return []
-fieldsOf prog nm              = do
+fieldsOf' :: Int -> Prog -> ClassName -> Maybe [Field]
+fieldsOf' fuel _prog (Name "Object") = return []
+fieldsOf' fuel prog nm              | fuel > 0 = do
   c <- find ((== nm) . className) (classes prog)
-  (++) <$> fieldsOf prog (superclass c) <*> pure (fields c)
+  (++) <$> fieldsOf' (fuel - 1) prog (superclass c) <*> pure (fields c)
+fieldsOf' _fuel _prog _nm = Nothing
 
-methodsOf :: Prog -> Name -> Maybe [Method]
-methodsOf _prog (Name "Object") = return []
-methodsOf prog nm               = do
+fieldsOf :: Prog -> ClassName -> Maybe [Field]
+fieldsOf p = fieldsOf' (length . classes $ p) p
+
+methodsOf' :: Int -> Prog -> ClassName -> Maybe [Method]
+methodsOf' fuel _prog (Name "Object") = return []
+methodsOf' fuel prog nm              | fuel > 0 = do
   c <- find ((== nm) . className) (classes prog)
-  (++) <$> methodsOf prog (superclass c) <*> pure (methods c)
+  (++) <$> methodsOf' (fuel - 1) prog (superclass c) <*> pure (methods c)
+methodsOf' _fuel _prog _nm = Nothing
+
+methodsOf :: Prog -> ClassName -> Maybe [Method]
+methodsOf p = methodsOf' (length . classes $ p) p
 
 methodType :: Prog -> MethodName -> ClassName -> Maybe MethodType
 methodType prog mn cn = do
@@ -245,7 +284,6 @@ forgetTypeAnnotations :: Prog -> Prog
 forgetTypeAnnotations = transformBi (\(e :: Expr) -> e { exprType = Nothing })
 
 -- Pretty Printing
-
 prettyProg :: Prog -> Doc
 prettyProg = vcat . map prettyClass . classes
 
@@ -285,7 +323,6 @@ prettyExpr (New _ c es) = text "new" <+> text (unName c) <> parens (sep $ punctu
 prettyExpr (Cast _ c e) = parens (text (unName c)) <> prettyExpr e
 
 -- Refactorings
-
 findClass :: (MonadError String m) => Prog -> ClassName -> m Class
 findClass prog classnm =  fromMaybe (throwError $ "Unknown class: " ++ unName classnm)
                                     (return <$> find ((== classnm) . className) (classes prog))
@@ -466,3 +503,40 @@ teacherInheritanceProg =
   let Just teacherProgTyped = checkTypes teacherProg
       Right teacherProgInheritance = replaceDelegationWithInheritance teacherProgTyped (Name "Teacher") (Name "person")
   in teacherProgInheritance
+
+
+-- Interface
+data TransformationInput a = TransformationInput
+            { tiProg :: Prog
+            , tiAux :: a
+            } deriving (Show, Eq)
+
+data Transformation a = Transformation
+            { tInputGen :: Gen (TransformationInput a)
+            , tTrans    :: TransformationInput a -> Maybe Prog
+            }
+
+
+-- Properties
+replaceDelegationWithInheritanceTransformation :: Transformation (ClassName, FieldName)
+replaceDelegationWithInheritanceTransformation = Transformation
+  {
+    tInputGen = do
+      prog <- arbitrary `suchThat` (\p ->
+                          any (\c ->
+                                 any (isRight . replaceDelegationWithInheritancePrecondition p (className c) . fieldName)
+                                         (fields c)) (classes p))
+      class' <- elements (filter (\c -> any (isRight . replaceDelegationWithInheritancePrecondition prog (className c) . fieldName)
+                                   (fields c)) $ classes prog)
+      field <-  elements (filter (isRight . replaceDelegationWithInheritancePrecondition prog (className class') . fieldName) $ fields class')
+      return $ TransformationInput prog (className class', fieldName field)
+  , tTrans = \(TransformationInput prog (cn, fn)) ->
+                   either (const Nothing) Just $ replaceDelegationWithInheritance prog cn fn }
+
+wellTypednessProperty :: Show a => Transformation a -> Property
+wellTypednessProperty tran =
+  forAll (tInputGen tran) (\input ->
+    let progTy = checkTypes (tiProg input)
+    in isJust progTy ==>
+         let progOut = tTrans tran input { tiProg = fromJust progTy }
+         in isJust (isWellformed <$> progOut) && isJust ((checkTypes . forgetTypeAnnotations) <$> progOut))
