@@ -10,9 +10,14 @@ import Data.Maybe
 import Data.Either
 import Data.Tuple
 import Data.Foldable
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
+import qualified Data.Graph as Graph
 
 import Data.Generics.Uniplate.Direct
 
+import Control.Applicative
 import Control.Monad
 import Control.Monad.Except
 
@@ -21,7 +26,7 @@ import Text.PrettyPrint
 import Test.QuickCheck
 
 newtype Name = Name { unName :: String }
-  deriving (Show, Eq)
+  deriving (Show, Eq, Ord)
 
 type ClassName  = Name
 type FieldName  = Name
@@ -29,6 +34,14 @@ type MethodName = Name
 
 newtype Prog = Prog { classes :: [Class] }
   deriving Eq
+
+data CachedProg = CachedProg
+  { cchProg :: Prog
+  , cchSupertypes :: Map ClassName [ClassName]
+  , cchFields :: Map ClassName [Field]
+  , cchMethods :: Map ClassName [Method]
+  }
+  deriving (Eq, Show)
 
 instance Show Prog where
   show = render . prettyProg
@@ -96,6 +109,34 @@ instance Arbitrary Readable where
     len <- (getSmall . getPositive) <$> arbitrary
     Readable <$> vectorOf len (elements (['A' .. 'Z'] ++ ['a'..'z']))
 
+updateCachedProg :: CachedProg -> Class -> CachedProg
+updateCachedProg cprog class' =
+  let prog = cchProg cprog
+      supertypes = cchSupertypes cprog
+      allFields = cchFields cprog
+      allMethods = cchMethods cprog
+  in cprog {
+    cchProg = prog { classes = class' : classes prog }
+  , cchSupertypes = Map.insert (className class') (
+      superclass class' : let Just supersuperty = Map.lookup (superclass class') supertypes in supersuperty) supertypes
+  , cchFields = Map.insert (className class') (
+     fields class' ++ let Just superFields = Map.lookup (superclass class') allFields in superFields) allFields
+  , cchMethods = Map.insert (className class') (
+     methods class' ++ let Just superMethods = Map.lookup (superclass class') allMethods in superMethods) allMethods
+  }
+
+emptyCachedProg :: CachedProg
+emptyCachedProg =  CachedProg (Prog []) (Map.singleton (Name "Object") [])
+                                        (Map.singleton (Name "Object") [])
+                                        (Map.singleton (Name "Object") [])
+
+makeCached :: Prog -> CachedProg
+makeCached prog =
+  let classKeyMap :: Map ClassName (Class, Int) = Map.fromList $ zipWith (\(cn, c) k -> (cn, (c, k))) (map (\c -> (className c, c)) $ classes prog) [1..]
+      (g,vm) = Graph.graphFromEdges' $ map (\(cn, (c, k)) -> (c, k, toList (snd <$> Map.lookup (superclass c) classKeyMap)))
+                                           (Map.toList classKeyMap)
+  in foldl updateCachedProg emptyCachedProg . map ((\(c,_,_) -> c) . vm) $ reverse $ Graph.topSort g
+
 genProgram :: Int -> Gen Prog
 genProgram size = do
   cnames <- nub <$> resize (size `div` 2) (listOf1 ((Name . getReadable) <$> arbitrary))
@@ -103,8 +144,10 @@ genProgram size = do
                                 ((\(c,fs,ms,sp) -> (c,fs,ms,Just sp)) <$> genClassP1Scoped gp1 cn (size `div` length cnames)))
                                  [(Name "Object", [], [], Nothing)] cnames
   let cs' = map (\(c,fs,ms,Just sp) -> (c,fs,ms,sp)) cs
-  foldlM (\prevProg ci -> (\c -> prevProg { classes = c : classes prevProg }) <$> genClassScoped prevProg cs' ci (size `div` length cs'))
-         (Prog []) [0 .. length cs' - 1]
+  cchProg <$> foldlM (\prevProg ci ->
+                       updateCachedProg prevProg <$>
+                         genClassScoped prevProg cs' ci (size `div` length cs'))
+         emptyCachedProg [0 .. length cs' - 1]
 
 instance Arbitrary Prog where
   arbitrary = sized genProgram
@@ -117,7 +160,7 @@ genClassP1Scoped prevClasses cn size = do
         <*> ((superms ++) <$> (nub <$> resize (size `div` 2) (listOf ((,) <$> ((Name . getReadable) <$> arbitrary) <*> ((getSmall . getPositive) <$> arbitrary)))))
         <*> pure super
 
-genClassScoped :: Prog -> [(ClassName, [FieldName], [(MethodName, Int)], ClassName)] -> Int -> Int -> Gen Class
+genClassScoped :: CachedProg -> [(ClassName, [FieldName], [(MethodName, Int)], ClassName)] -> Int -> Int -> Gen Class
 genClassScoped prevProg classes index size = do
   let (cn, fs, ms, sn) = classes !! index
   let Just sfvals = fieldsOf prevProg sn
@@ -156,100 +199,73 @@ infixr 6 :=>:
 data MethodType = [ClassName] :=>: ClassName
   deriving (Show, Eq)
 
-isWellformed :: Prog -> Bool
-isWellformed prog = all (isWellformedClass prog . className) (classes prog)
+isSubtype :: CachedProg -> ClassName -> ClassName -> Bool
+isSubtype p c1 c2 = c1 == c2 || any (c2 `elem`) (Map.lookup c1 (cchSupertypes p))
 
-isWellformedClass :: Prog -> ClassName -> Bool
-isWellformedClass _prog (Name "Object") = True
-isWellformedClass prog cn           = any (tryReach . superclass) (findClass prog cn :: Either String Class)
-  where tryReach (Name "Object") = True
-        tryReach cn' | cn == cn' = False
-        tryReach cn' =  any (tryReach . superclass) (findClass prog cn' :: Either String Class)
+fieldsOf :: CachedProg -> ClassName -> Maybe [Field]
+fieldsOf p = flip Map.lookup (cchFields p)
 
-isSubtype' :: Int -> Prog -> ClassName -> ClassName -> Bool
-isSubtype' fuel _prog cn cn' | cn == cn' = True
-isSubtype' fuel prog cn cn'  | fuel > 0 =
-  fromMaybe False (do c <- find ((== cn) . className) (classes prog)
-                      return $ isSubtype' (fuel - 1) prog (superclass c) cn')
-isSubtype' _fuel _prog _cn _cn' = False
+methodsOf :: CachedProg -> ClassName -> Maybe [Method]
+methodsOf p = flip Map.lookup (cchMethods p)
 
-isSubtype :: Prog -> ClassName -> ClassName -> Bool
-isSubtype p = isSubtype' (length . classes $ p) p
-
-fieldsOf' :: Int -> Prog -> ClassName -> Maybe [Field]
-fieldsOf' fuel _prog (Name "Object") = return []
-fieldsOf' fuel prog nm              | fuel > 0 = do
-  c <- find ((== nm) . className) (classes prog)
-  (++) <$> fieldsOf' (fuel - 1) prog (superclass c) <*> pure (fields c)
-fieldsOf' _fuel _prog _nm = Nothing
-
-fieldsOf :: Prog -> ClassName -> Maybe [Field]
-fieldsOf p = fieldsOf' (length . classes $ p) p
-
-methodsOf' :: Int -> Prog -> ClassName -> Maybe [Method]
-methodsOf' fuel _prog (Name "Object") = return []
-methodsOf' fuel prog nm              | fuel > 0 = do
-  c <- find ((== nm) . className) (classes prog)
-  (++) <$> methodsOf' (fuel - 1) prog (superclass c) <*> pure (methods c)
-methodsOf' _fuel _prog _nm = Nothing
-
-methodsOf :: Prog -> ClassName -> Maybe [Method]
-methodsOf p = methodsOf' (length . classes $ p) p
-
-methodType :: Prog -> MethodName -> ClassName -> Maybe MethodType
+methodType :: CachedProg -> MethodName -> ClassName -> Maybe MethodType
 methodType prog mn cn = do
   mets <- reverse <$> methodsOf prog cn
   m <- find ((== mn) . methodName) mets
   return (map fst (methodParameters m) :=>: methodReturnType m)
 
-methodBody :: Prog -> MethodName -> ClassName -> Maybe Expr
+methodBody :: CachedProg -> MethodName -> ClassName -> Maybe Expr
 methodBody prog mn cn = do
   mets <- reverse <$> methodsOf prog cn
   m <- find ((== mn) . methodName) mets
   return (methodBodyExpr m)
 
 checkScope :: Prog -> Bool
-checkScope prog = all (checkClassScope prog) (classes prog)
+checkScope prog =
+  let cprog = makeCached prog
+  in all (checkClassScope cprog) (classes prog)
 
-checkClassScope :: Prog -> Class -> Bool
+checkClassScope :: CachedProg -> Class -> Bool
 checkClassScope prog (Class cn sn cflds (Constructor iflds sflds) meths) =
      iflds == sflds ++ cflds
   && elem sflds (fieldsOf prog sn)
   && all (checkMethodScope prog) meths
 
-checkMethodScope :: Prog -> Method -> Bool
+checkMethodScope :: CachedProg -> Method -> Bool
 checkMethodScope prog (Method _rty _mnm pars mbody) = checkExpressionScope prog (map snd pars ++ [Name "this"]) mbody
 
-checkExpressionScope :: Prog -> [Name] -> Expr -> Bool
+checkExpressionScope :: CachedProg -> [Name] -> Expr -> Bool
 checkExpressionScope _prog env (Var Nothing nm)           = nm `elem` env
-checkExpressionScope prog env (FieldAccess Nothing e f)   = checkExpressionScope prog env e && any (any (any ((== f) . fieldName)) . fieldsOf prog . className) (classes prog)
+checkExpressionScope prog env (FieldAccess Nothing e f)   =
+  checkExpressionScope prog env e && any ((== f) . fieldName) (concat . Map.elems . cchFields $ prog)
 checkExpressionScope prog env (MethodCall Nothing e m es) =
    checkExpressionScope prog env e &&
-   any (any (any (\m' -> length (methodParameters m') == length es && ((== m) . methodName $ m'))) . methodsOf prog . className) (classes prog) &&
+   any (\m' -> length (methodParameters m') == length es && ((== m) . methodName $ m'))
+       (concat . Map.elems . cchMethods $ prog) &&
    all (checkExpressionScope prog env) es
-checkExpressionScope prog env (New Nothing c es)          = length (fromJust $ fieldsOf prog c) == length es && all (checkExpressionScope prog env) es
+checkExpressionScope prog env (New Nothing c es)          = length (let Just fs = fieldsOf prog c in fs) == length es && all (checkExpressionScope prog env) es
 checkExpressionScope prog env (Cast Nothing _c e)         = checkExpressionScope prog env e
 checkExpressionScope prog env _                           = False
 
-checkTypes :: Prog -> Maybe Prog
-checkTypes prog = Prog <$> mapM (checkClassType prog) (classes prog)
+checkTypes :: CachedProg -> Maybe CachedProg
+checkTypes prog = (makeCached . Prog) <$> mapM (checkClassType prog) (classes . cchProg $ prog)
 
-checkClassType :: Prog -> Class -> Maybe Class
+checkClassType :: CachedProg -> Class -> Maybe Class
 checkClassType prog (Class cn sn cflds (Constructor iflds sflds) meths) = do
      guard $ iflds == sflds ++ cflds
      guard $ elem sflds (fieldsOf prog sn)
      meths' <- mapM (checkMethodType prog cn) meths
      return (Class cn sn cflds (Constructor iflds sflds) meths')
 
-checkMethodType :: Prog -> ClassName -> Method -> Maybe Method
+checkMethodType :: CachedProg -> ClassName -> Method -> Maybe Method
 checkMethodType prog cn (Method rty mnm pars mbody) = do
-  c <- find ((== cn) . className) (classes prog)
-  guard $ all (\(sparty :=>: srty) -> map fst pars == sparty && rty == srty) (methodType prog mnm (superclass c))
+  csuper:_ <- Map.lookup cn (cchSupertypes prog)
+  guard $ all (\(sparty :=>: srty) -> map fst pars == sparty && rty == srty) (methodType prog mnm csuper)
   (bodyty, mbody') <- typeExpression prog (pars ++ [(cn, Name "this")]) mbody
   guard $ isSubtype prog bodyty rty
   return $ Method rty mnm pars mbody'
 
-typeExpression :: Prog -> [(ClassName, Name)] -> Expr -> Maybe (ClassName, Expr)
+typeExpression :: CachedProg -> [(ClassName, Name)] -> Expr -> Maybe (ClassName, Expr)
 -- a pair of result type and type-annotated expression
 typeExpression prog env (Var Nothing x) =
   let xty = lookup x (map swap env)
@@ -328,9 +344,9 @@ findClass prog classnm =  fromMaybe (throwError $ "Unknown class: " ++ unName cl
                                     (return <$> find ((== classnm) . className) (classes prog))
 
 
-renameFieldPrecondition :: (MonadError String m) => Prog -> ClassName -> FieldName -> FieldName -> m ()
+renameFieldPrecondition :: (MonadError String m) => CachedProg -> ClassName -> FieldName -> FieldName -> m ()
 renameFieldPrecondition prog classnm oldfieldnm newfieldnm = do
-  class'      <- findClass prog classnm
+  class'      <- findClass (cchProg prog) classnm
   unless (any ((== oldfieldnm) . fieldName) $ fields class') $
         throwError ("Class " ++ unName classnm ++ "does not have field " ++ unName oldfieldnm)
   when   (any (any ((== newfieldnm) . fieldName)) $ fieldsOf prog classnm) $
@@ -338,7 +354,7 @@ renameFieldPrecondition prog classnm oldfieldnm newfieldnm = do
                   "or one of its superclasses already have field " ++ unName newfieldnm)
 
 
-renameField :: (MonadError String m) => Prog -> ClassName -> FieldName -> FieldName -> m Prog
+renameField :: (MonadError String m) => CachedProg -> ClassName -> FieldName -> FieldName -> m Prog
 renameField prog classnm oldfieldnm newfieldnm = do
   renameFieldPrecondition prog classnm oldfieldnm newfieldnm
   let prog' = rewriteBi (\(c :: Class) ->
@@ -355,28 +371,28 @@ renameField prog classnm oldfieldnm newfieldnm = do
                                                                 else a) $ constructorArguments (constructor c)
                                                             }
                                 }
-                            else Nothing) prog
+                            else Nothing) (cchProg prog)
   return $ rewriteBi (\(e :: Expr) ->
                         case e of
                           FieldAccess (Just c) e f ->
-                            if isSubtype prog' c classnm && f == oldfieldnm
+                            if isSubtype prog c classnm && f == oldfieldnm
                             then return $ FieldAccess (Just c) e newfieldnm
                             else Nothing
                           _ -> Nothing) prog'
 
 
-extractSuperPrecondition :: (MonadError String m) =>  Prog -> ClassName -> ClassName -> ClassName -> m (Class, Class)
+extractSuperPrecondition :: (MonadError String m) => CachedProg -> ClassName -> ClassName -> ClassName -> m (Class, Class)
 extractSuperPrecondition prog class1nm class2nm newsupernm = do
-  class1 <- findClass prog class1nm
-  class2 <- findClass prog class2nm
+  class1 <- findClass (cchProg prog) class1nm
+  class2 <- findClass (cchProg prog) class2nm
   unless (superclass class1 == superclass class2) $
     throwError $ "The provided classes " ++ unName class1nm ++ " and " ++
                    unName class2nm ++ " do not have the same supertype"
-  when (any ((== newsupernm) . className) (classes prog)) $
+  when (Set.member newsupernm . Map.keysSet $ cchSupertypes prog) $
     throwError $ "Target superclass name, " ++ unName newsupernm ++ " is already in use"
   return (class1, class2)
 
-extractSuper :: (MonadError String m) => Prog -> ClassName -> ClassName -> ClassName -> m Prog
+extractSuper :: (MonadError String m) => CachedProg -> ClassName -> ClassName -> ClassName -> m Prog
 extractSuper prog class1nm class2nm newsupernm = do
   (class1, class2) <- extractSuperPrecondition prog class1nm class2nm newsupernm
   let commonFields  = fields class1 `intersect` fields class2
@@ -395,23 +411,23 @@ extractSuper prog class1nm class2nm newsupernm = do
                                   methods = newmethods,
                                   constructor = Constructor (newsuperfields ++ newfields) newsuperfields,
                                   superclass = newsupernm }
-                           else Nothing) prog
+                           else Nothing) (cchProg prog)
   let prog'' = prog' { classes = Class newsupernm prevsupernm commonFields
                                        (Constructor (prevsuperfields ++ commonFields) prevsuperfields) commonMethods :
                                          classes prog' }
   -- TODO Extend extract superclass to handle generalization of function parameters and other local variables where possible
   return prog''
 
-replaceDelegationWithInheritancePrecondition :: (MonadError String m) => Prog -> ClassName -> FieldName -> m (Class, Field)
+replaceDelegationWithInheritancePrecondition :: (MonadError String m) => CachedProg -> ClassName -> FieldName -> m (Class, Field)
 replaceDelegationWithInheritancePrecondition prog classnm fieldnm = do
-  class' <- findClass prog classnm
+  class' <- findClass (cchProg prog) classnm
   unless (superclass class' == Name "Object") $
     throwError $ "Class " ++ unName classnm ++ " already has a superclass " ++ unName (superclass class')
   field <- fromMaybe (throwError $ "Class " ++ unName classnm ++ " does not contain field " ++ unName fieldnm)
                      (return <$> find ((== fieldnm) . fieldName) (fields class'))
   return (class', field)
 
-replaceDelegationWithInheritance :: (MonadError String m) => Prog -> ClassName -> FieldName -> m Prog
+replaceDelegationWithInheritance :: (MonadError String m) => CachedProg -> ClassName -> FieldName -> m Prog
 replaceDelegationWithInheritance prog classnm fieldnm = do
   (class', field) <- replaceDelegationWithInheritancePrecondition prog classnm fieldnm
   let fty = fieldType field
@@ -440,11 +456,11 @@ replaceDelegationWithInheritance prog classnm fieldnm = do
                                                FieldAccess (Just _cf) v@(Var (Just _ct) (Name "this")) fn | fieldnm == fn -> return v
                                                _ -> Nothing) c'
                              in return c''
-                           else Nothing) prog
+                           else Nothing) (cchProg prog)
   let prog'' = rewriteBi (\(e :: Expr) ->
                             case e of
                               FieldAccess (Just _tc) e fn
-                                | Just ety <- exprType e, isSubtype prog' ety classnm && fieldnm == fn -> return e
+                                | Just ety <- exprType e, isSubtype prog ety classnm && fieldnm == fn -> return e
                               _ -> Nothing) prog'
   return prog''
 
@@ -460,7 +476,8 @@ animalProg = Prog [
 
 renamedHappiness :: Prog
 renamedHappiness =
-  let Just animalProgTyped    = checkTypes animalProg
+  let animalProgCached   = makeCached animalProg
+      Just animalProgTyped    = checkTypes animalProgCached
       Right animalProgRenamed = renameField animalProgTyped (Name "Animal") (Name "happiness") (Name "excitement")
   in animalProgRenamed
 
@@ -482,7 +499,8 @@ accountProg = Prog [
 
 extractAccountSuperProg :: Prog
 extractAccountSuperProg =
-  let Just accountProgTyped = checkTypes accountProg
+  let accountProgCached = makeCached accountProg
+      Just accountProgTyped = checkTypes accountProgCached
       Right accountProgSuperExtracted = extractSuper accountProgTyped (Name "SuperSavingsAccount") (Name "BasicAccount") (Name "Account")
   in accountProgSuperExtracted
 
@@ -500,14 +518,15 @@ teacherProg = Prog [
 
 teacherInheritanceProg :: Prog
 teacherInheritanceProg =
-  let Just teacherProgTyped = checkTypes teacherProg
+  let teacherProgCached = makeCached teacherProg
+      Just teacherProgTyped = checkTypes teacherProgCached
       Right teacherProgInheritance = replaceDelegationWithInheritance teacherProgTyped (Name "Teacher") (Name "person")
   in teacherProgInheritance
 
 
 -- Interface
 data TransformationInput a = TransformationInput
-            { tiProg :: Prog
+            { tiProg :: CachedProg
             , tiAux :: a
             } deriving (Show, Eq)
 
@@ -522,14 +541,16 @@ replaceDelegationWithInheritanceTransformation :: Transformation (ClassName, Fie
 replaceDelegationWithInheritanceTransformation = Transformation
   {
     tInputGen = do
-      prog <- arbitrary `suchThat` (\p ->
-                          any (\c ->
-                                 any (isRight . replaceDelegationWithInheritancePrecondition p (className c) . fieldName)
-                                         (fields c)) (classes p))
-      class' <- elements (filter (\c -> any (isRight . replaceDelegationWithInheritancePrecondition prog (className c) . fieldName)
-                                   (fields c)) $ classes prog)
-      field <-  elements (filter (isRight . replaceDelegationWithInheritancePrecondition prog (className class') . fieldName) $ fields class')
-      return $ TransformationInput prog (className class', fieldName field)
+      prog <- arbitrary `suchThat` (\(p :: Prog) ->
+                          let cp = makeCached p
+                          in any (\c ->
+                                   any (isRight . replaceDelegationWithInheritancePrecondition cp (className c) . fieldName)
+                                    (fields c)) (classes . cchProg $ cp))
+      let cprog = makeCached prog
+      class' <- elements (filter (\c -> any (isRight . replaceDelegationWithInheritancePrecondition cprog (className c) . fieldName)
+                                   (fields c)) (classes . cchProg $ cprog))
+      field <-  elements (filter (isRight . replaceDelegationWithInheritancePrecondition cprog (className class') . fieldName) $ fields class')
+      return $ TransformationInput (makeCached prog) (className class', fieldName field)
   , tTrans = \(TransformationInput prog (cn, fn)) ->
                    either (const Nothing) Just $ replaceDelegationWithInheritance prog cn fn }
 
@@ -539,4 +560,4 @@ wellTypednessProperty tran =
     let progTy = checkTypes (tiProg input)
     in isJust progTy ==>
          let progOut = tTrans tran input { tiProg = fromJust progTy }
-         in isJust (isWellformed <$> progOut) && isJust ((checkTypes . forgetTypeAnnotations) <$> progOut))
+         in isJust ((checkTypes . makeCached) <$> (forgetTypeAnnotations <$> progOut)))
