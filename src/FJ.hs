@@ -1,4 +1,4 @@
-{-# LANGUAGE ScopedTypeVariables, MultiParamTypeClasses, FlexibleContexts #-}
+{-# LANGUAGE ScopedTypeVariables, MultiParamTypeClasses, FlexibleContexts, MultiWayIf #-}
 {-# OPTIONS_GHC -fwarn-incomplete-patterns #-}
 {-# OPTIONS_GHC -F -pgmFderive -optF-F #-}
 module FJ where
@@ -24,6 +24,7 @@ import Control.Monad.Except
 import Text.PrettyPrint
 
 import Test.QuickCheck
+import qualified Test.LazySmallCheck as LSC
 
 newtype Name = Name { unName :: String }
   deriving (Show, Eq, Ord)
@@ -35,6 +36,9 @@ type MethodName = Name
 newtype Prog = Prog { classes :: [Class] }
   deriving Eq
 
+instance Show Prog where
+  show = render . prettyProg
+
 data CachedProg = CachedProg
   { cchProg :: Prog
   , cchSupertypes :: Map ClassName [ClassName]
@@ -42,9 +46,6 @@ data CachedProg = CachedProg
   , cchMethods :: Map ClassName [Method]
   }
   deriving (Eq, Show)
-
-instance Show Prog where
-  show = render . prettyProg
 
 data Class = Class
             { className :: Name
@@ -98,6 +99,33 @@ deriving instance UniplateDirect Method Expr
 deriving instance UniplateDirect Expr
 !-}
 
+-- Serial
+
+instance LSC.Serial Prog where
+  series = LSC.cons1 Prog
+
+instance LSC.Serial Class where
+  series = LSC.cons5 Class
+
+instance LSC.Serial Field where
+  series = LSC.cons2 Field
+
+instance LSC.Serial Constructor where
+  series = LSC.cons2 Constructor
+
+instance LSC.Serial Method where
+  series = LSC.cons4 Method
+
+instance LSC.Serial Expr where
+  series =  LSC.cons1 (Var Nothing)
+            LSC.\/ LSC.cons2 (FieldAccess Nothing)
+            LSC.\/ LSC.cons3 (MethodCall Nothing)
+            LSC.\/ LSC.cons2 (New Nothing)
+            LSC.\/ LSC.cons2 (Cast Nothing)
+
+instance LSC.Serial Name where
+  series = LSC.cons1 Name
+
 -- Generators
 unique :: Eq a => [a] -> Bool
 unique xs = nub xs == xs
@@ -109,33 +137,38 @@ instance Arbitrary Readable where
     len <- (getSmall . getPositive) <$> arbitrary
     Readable <$> vectorOf len (elements (['A' .. 'Z'] ++ ['a'..'z']))
 
-updateCachedProg :: CachedProg -> Class -> CachedProg
+updateCachedProg :: CachedProg -> Class -> Maybe CachedProg
 updateCachedProg cprog class' =
   let prog = cchProg cprog
+      super = superclass class'
       supertypes = cchSupertypes cprog
       allFields = cchFields cprog
       allMethods = cchMethods cprog
-  in cprog {
-    cchProg = prog { classes = class' : classes prog }
-  , cchSupertypes = Map.insert (className class') (
-      superclass class' : let Just supersuperty = Map.lookup (superclass class') supertypes in supersuperty) supertypes
-  , cchFields = Map.insert (className class') (
-     fields class' ++ let Just superFields = Map.lookup (superclass class') allFields in superFields) allFields
-  , cchMethods = Map.insert (className class') (
-     methods class' ++ let Just superMethods = Map.lookup (superclass class') allMethods in superMethods) allMethods
-  }
+  in if |  Just supersuperty <- Map.lookup (superclass class') supertypes
+         , Just superFields  <- Map.lookup (superclass class') allFields
+         , Just superMethods <- Map.lookup (superclass class') allMethods ->
+                return cprog {
+                  cchProg = prog { classes = class' : classes prog }
+                , cchSupertypes = Map.insert (className class') (
+                    superclass class' : supersuperty) supertypes
+                , cchFields = Map.insert (className class') (
+                  fields class' ++ superFields) allFields
+                , cchMethods = Map.insert (className class') (
+                  methods class' ++ superMethods) allMethods
+              }
+        | otherwise -> Nothing
 
 emptyCachedProg :: CachedProg
 emptyCachedProg =  CachedProg (Prog []) (Map.singleton (Name "Object") [])
                                         (Map.singleton (Name "Object") [])
                                         (Map.singleton (Name "Object") [])
 
-makeCached :: Prog -> CachedProg
+makeCached :: Prog -> Maybe CachedProg
 makeCached prog =
   let classKeyMap :: Map ClassName (Class, Int) = Map.fromList $ zipWith (\(cn, c) k -> (cn, (c, k))) (map (\c -> (className c, c)) $ classes prog) [1..]
       (g,vm) = Graph.graphFromEdges' $ map (\(cn, (c, k)) -> (c, k, toList (snd <$> Map.lookup (superclass c) classKeyMap)))
                                            (Map.toList classKeyMap)
-  in foldl updateCachedProg emptyCachedProg . map ((\(c,_,_) -> c) . vm) $ reverse $ Graph.topSort g
+  in foldlM updateCachedProg emptyCachedProg . map ((\(c,_,_) -> c) . vm) $ reverse $ Graph.topSort g
 
 genProgram :: Int -> Gen Prog
 genProgram size = do
@@ -145,8 +178,8 @@ genProgram size = do
                                  [(Name "Object", [], [], Nothing)] cnames
   let cs' = map (\(c,fs,ms,Just sp) -> (c,fs,ms,sp)) cs
   cchProg <$> foldlM (\prevProg ci ->
-                       updateCachedProg prevProg <$>
-                         genClassScoped prevProg cs' ci (size `div` length cs'))
+                        (fromJust . updateCachedProg prevProg) <$>
+                          genClassScoped prevProg cs' ci (size `div` length cs'))
          emptyCachedProg [0 .. length cs' - 1]
 
 instance Arbitrary Prog where
@@ -222,8 +255,9 @@ methodBody prog mn cn = do
 
 checkScope :: Prog -> Bool
 checkScope prog =
-  let cprog = makeCached prog
-  in all (checkClassScope cprog) (classes prog)
+  case makeCached prog of
+    Just cprog -> all (checkClassScope cprog) (classes prog)
+    Nothing    -> False
 
 checkClassScope :: CachedProg -> Class -> Bool
 checkClassScope prog (Class cn sn cflds (Constructor iflds sflds) meths) =
@@ -248,7 +282,7 @@ checkExpressionScope prog env (Cast Nothing _c e)         = checkExpressionScope
 checkExpressionScope prog env _                           = False
 
 checkTypes :: CachedProg -> Maybe CachedProg
-checkTypes prog = (makeCached . Prog) <$> mapM (checkClassType prog) (classes . cchProg $ prog)
+checkTypes prog = makeCached =<< (Prog <$> mapM (checkClassType prog) (classes . cchProg $ prog))
 
 checkClassType :: CachedProg -> Class -> Maybe Class
 checkClassType prog (Class cn sn cflds (Constructor iflds sflds) meths) = do
@@ -476,7 +510,7 @@ animalProg = Prog [
 
 renamedHappiness :: Prog
 renamedHappiness =
-  let animalProgCached   = makeCached animalProg
+  let Just animalProgCached   = makeCached animalProg
       Just animalProgTyped    = checkTypes animalProgCached
       Right animalProgRenamed = renameField animalProgTyped (Name "Animal") (Name "happiness") (Name "excitement")
   in animalProgRenamed
@@ -499,7 +533,7 @@ accountProg = Prog [
 
 extractAccountSuperProg :: Prog
 extractAccountSuperProg =
-  let accountProgCached = makeCached accountProg
+  let Just accountProgCached = makeCached accountProg
       Just accountProgTyped = checkTypes accountProgCached
       Right accountProgSuperExtracted = extractSuper accountProgTyped (Name "SuperSavingsAccount") (Name "BasicAccount") (Name "Account")
   in accountProgSuperExtracted
@@ -518,7 +552,7 @@ teacherProg = Prog [
 
 teacherInheritanceProg :: Prog
 teacherInheritanceProg =
-  let teacherProgCached = makeCached teacherProg
+  let Just teacherProgCached = makeCached teacherProg
       Just teacherProgTyped = checkTypes teacherProgCached
       Right teacherProgInheritance = replaceDelegationWithInheritance teacherProgTyped (Name "Teacher") (Name "person")
   in teacherProgInheritance
@@ -543,14 +577,14 @@ replaceDelegationWithInheritanceTransformation = Transformation
     tInputGen = do
       prog <- arbitrary `suchThat` (\(p :: Prog) ->
                           let cp = makeCached p
-                          in any (\c ->
-                                   any (isRight . replaceDelegationWithInheritancePrecondition cp (className c) . fieldName)
-                                    (fields c)) (classes . cchProg $ cp))
-      let cprog = makeCached prog
+                          in isJust cp && any (\c ->
+                                            any (isRight . replaceDelegationWithInheritancePrecondition (fromJust cp) (className c) . fieldName)
+                                              (fields c)) (classes . cchProg $ fromJust cp))
+      let Just cprog = makeCached prog
       class' <- elements (filter (\c -> any (isRight . replaceDelegationWithInheritancePrecondition cprog (className c) . fieldName)
                                    (fields c)) (classes . cchProg $ cprog))
       field <-  elements (filter (isRight . replaceDelegationWithInheritancePrecondition cprog (className class') . fieldName) $ fields class')
-      return $ TransformationInput (makeCached prog) (className class', fieldName field)
+      return $ TransformationInput cprog (className class', fieldName field)
   , tTrans = \(TransformationInput prog (cn, fn)) ->
                    either (const Nothing) Just $ replaceDelegationWithInheritance prog cn fn }
 
@@ -560,4 +594,14 @@ wellTypednessProperty tran =
     let progTy = checkTypes (tiProg input)
     in isJust progTy ==>
          let progOut = tTrans tran input { tiProg = fromJust progTy }
-         in isJust ((checkTypes . makeCached) <$> (forgetTypeAnnotations <$> progOut)))
+         in isJust (checkTypes <$> (makeCached =<< (forgetTypeAnnotations <$> progOut))))
+
+
+replaceDelegationWithInheritanceWellTypedSC :: (Prog, ClassName, FieldName) -> LSC.Property
+replaceDelegationWithInheritanceWellTypedSC (prog, cn, fn) =
+  let
+    cprog  = makeCached prog
+    progTy = checkTypes =<< cprog
+  in  (LSC.lift (isJust progTy) LSC.*&* LSC.lift (isRight (runExcept $ replaceDelegationWithInheritancePrecondition (fromJust progTy) cn fn)))
+        LSC.*=>* let progOut = replaceDelegationWithInheritance (fromJust progTy) cn fn
+                 in LSC.lift (isJust (checkTypes <$> (makeCached =<< (forgetTypeAnnotations <$> either (const Nothing) Just progOut))))
