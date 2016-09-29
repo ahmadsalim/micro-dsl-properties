@@ -566,27 +566,60 @@ data TransformationInput a = TransformationInput
 
 data Transformation a = Transformation
             { tInputGen :: Gen (TransformationInput a)
+            , tPrecond  :: TransformationInput a -> Bool
             , tTrans    :: TransformationInput a -> Maybe Prog
             }
 
 
 -- Properties
+
+renameFieldInputGen :: Gen (TransformationInput (ClassName, FieldName, FieldName))
+renameFieldInputGen = _
+
+renameFieldTransformation :: Transformation (ClassName, FieldName, FieldName)
+renameFieldTransformation = Transformation
+  { tInputGen = renameFieldInputGen
+  , tPrecond = \(TransformationInput prog (cn, ofn, nfn)) -> isRight (renameFieldPrecondition prog cn ofn nfn)
+  , tTrans = \(TransformationInput prog (cn, ofn, nfn)) -> either (const Nothing) Just $ renameField prog cn ofn nfn
+  }
+
+extractSuperInputGen :: Gen (TransformationInput (ClassName, ClassName, ClassName))
+extractSuperInputGen = _
+
+extractSuperTransformation :: Transformation (ClassName, ClassName, ClassName)
+extractSuperTransformation = Transformation
+  { tInputGen = extractSuperInputGen
+  , tPrecond = \(TransformationInput prog (cn1, cn2, cnsuper)) -> isRight (extractSuperPrecondition prog cn1 cn2 cnsuper)
+  , tTrans = \(TransformationInput prog (cn1, cn2, cnsuper)) -> either (const Nothing) Just $ extractSuper prog cn1 cn2 cnsuper
+  }
+
+replaceDelegationWithInheritanceInputGen :: Gen (TransformationInput (ClassName, FieldName))
+replaceDelegationWithInheritanceInputGen = do
+      prog <- arbitrary `suchThat`
+               (\(p :: Prog) ->
+                  let cp = makeCached p
+                  in isJust cp &&
+                       any (\c -> any
+                             (isRight . replaceDelegationWithInheritancePrecondition (fromJust cp) (className c) .
+                                            fieldName) (fields c)) (classes . cchProg $ fromJust cp))
+      let Just cprog = makeCached prog
+      class' <- elements (filter
+                            (\c -> any
+                              (isRight . replaceDelegationWithInheritancePrecondition cprog (className c) .
+                                  fieldName) (fields c)) (classes . cchProg $ cprog))
+      field <-  elements (filter (isRight . replaceDelegationWithInheritancePrecondition cprog (className class') .
+                                  fieldName) $ fields class')
+      return $ TransformationInput cprog (className class', fieldName field)
+
+
 replaceDelegationWithInheritanceTransformation :: Transformation (ClassName, FieldName)
 replaceDelegationWithInheritanceTransformation = Transformation
-  {
-    tInputGen = do
-      prog <- arbitrary `suchThat` (\(p :: Prog) ->
-                          let cp = makeCached p
-                          in isJust cp && any (\c ->
-                                            any (isRight . replaceDelegationWithInheritancePrecondition (fromJust cp) (className c) . fieldName)
-                                              (fields c)) (classes . cchProg $ fromJust cp))
-      let Just cprog = makeCached prog
-      class' <- elements (filter (\c -> any (isRight . replaceDelegationWithInheritancePrecondition cprog (className c) . fieldName)
-                                   (fields c)) (classes . cchProg $ cprog))
-      field <-  elements (filter (isRight . replaceDelegationWithInheritancePrecondition cprog (className class') . fieldName) $ fields class')
-      return $ TransformationInput cprog (className class', fieldName field)
+  { tInputGen = replaceDelegationWithInheritanceInputGen
+  , tPrecond = \(TransformationInput prog (cn, fn)) ->
+                  isRight (replaceDelegationWithInheritancePrecondition prog cn fn)
   , tTrans = \(TransformationInput prog (cn, fn)) ->
-                   either (const Nothing) Just $ replaceDelegationWithInheritance prog cn fn }
+                   either (const Nothing) Just $ replaceDelegationWithInheritance prog cn fn
+  }
 
 wellTypednessProperty :: Show a => Transformation a -> Property
 wellTypednessProperty tran =
@@ -596,12 +629,24 @@ wellTypednessProperty tran =
          let progOut = tTrans tran input { tiProg = fromJust progTy }
          in isJust (checkTypes <$> (makeCached =<< (forgetTypeAnnotations <$> progOut))))
 
-
-replaceDelegationWithInheritanceWellTypedSC :: (Prog, ClassName, FieldName) -> LSC.Property
-replaceDelegationWithInheritanceWellTypedSC (prog, cn, fn) =
+wellTypednessPropertySC :: Transformation a -> (Prog, a) -> LSC.Property
+wellTypednessPropertySC tran (prog, aux) =
   let
-    cprog  = makeCached prog
+    cprog = makeCached prog
     progTy = checkTypes =<< cprog
-  in  (LSC.lift (isJust progTy) LSC.*&* LSC.lift (isRight (runExcept $ replaceDelegationWithInheritancePrecondition (fromJust progTy) cn fn)))
-        LSC.*=>* let progOut = replaceDelegationWithInheritance (fromJust progTy) cn fn
-                 in LSC.lift (isJust (checkTypes <$> (makeCached =<< (forgetTypeAnnotations <$> either (const Nothing) Just progOut))))
+    tinput = TransformationInput (fromJust cprog) aux
+  in
+    LSC.lift (isJust progTy) LSC.*&* LSC.lift (tPrecond tran tinput)
+      LSC.*=>* let
+                 progOut = tTrans tran tinput
+               in LSC.lift (isJust (checkTypes <$> (makeCached =<< (forgetTypeAnnotations <$> progOut))))
+
+-- Sampling from Generators
+
+sampleScoped :: IO ()
+sampleScoped = do
+  vs <- sample' (arbitrary :: Gen Prog)
+  let welltyped = filter (\v -> isJust (makeCached v >>= checkTypes)) vs
+  mapM_ (putStrLn . (++ "\n\n\n------------------------------") . show)
+    welltyped
+  putStrLn ("Generated program count total: " ++ show (length vs) ++ "\n" ++ "Generated program count well-typed: " ++ show (length welltyped))
