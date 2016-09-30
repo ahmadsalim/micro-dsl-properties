@@ -1,4 +1,4 @@
-{-# LANGUAGE ScopedTypeVariables, MultiParamTypeClasses, FlexibleContexts, MultiWayIf #-}
+{-# LANGUAGE ScopedTypeVariables, MultiParamTypeClasses, FlexibleContexts, MultiWayIf, TypeOperators #-}
 {-# OPTIONS_GHC -fwarn-incomplete-patterns #-}
 {-# OPTIONS_GHC -F -pgmFderive -optF-F #-}
 module FJ where
@@ -20,11 +20,15 @@ import Data.Generics.Uniplate.Direct
 import Control.Applicative
 import Control.Monad
 import Control.Monad.Except
+import Control.Monad.Trans.Class as Trans
+import Control.Monad.Trans.Maybe
 
 import Text.PrettyPrint
 
 import Test.QuickCheck
 import qualified Test.LazySmallCheck as LSC
+
+type f $ a = f a
 
 newtype Name = Name { unName :: String }
   deriving (Show, Eq, Ord)
@@ -565,7 +569,7 @@ data TransformationInput a = TransformationInput
             } deriving (Show, Eq)
 
 data Transformation a = Transformation
-            { tInputGen :: Gen (TransformationInput a)
+            { tInputGen :: Gen (Maybe $ TransformationInput a)
             , tPrecond  :: TransformationInput a -> Bool
             , tTrans    :: TransformationInput a -> Maybe Prog
             }
@@ -573,78 +577,85 @@ data Transformation a = Transformation
 
 -- Properties
 
-renameFieldInputGen :: Gen (TransformationInput (ClassName, FieldName, FieldName))
+renameFieldInputGen :: MaybeT Gen (TransformationInput (ClassName, FieldName, FieldName))
 renameFieldInputGen = do
-  prog <- arbitrary `suchThat`
+  prog <- MaybeT $ arbitrary `suchThatMaybe`
                       (\(p :: Prog) ->
                          any (\cp -> any (\c -> not (null $ fields c)) (classes . cchProg $ cp))
                                         (makeCached p))
   let Just cp = makeCached prog
-  class' <- elements (filter (\c -> not (null $ fields c)) (classes . cchProg $ cp))
-  oldfield <- fieldName <$> elements (fields class')
-  newfield <- (Name . getReadable) <$> (arbitrary `suchThat` (\(Readable n) -> any (Name n `notElem`) $
+  class' <- Trans.lift $ elements (filter (\c -> not (null $ fields c)) (classes . cchProg $ cp))
+  oldfield <- Trans.lift (fieldName <$> elements (fields class'))
+  newfield <- (Name . getReadable) <$> (MaybeT $ arbitrary `suchThatMaybe` (\(Readable n) -> any (Name n `notElem`) $
                                                                fmap (map fieldName) (fieldsOf cp (className class'))))
   return $ TransformationInput cp (className class', oldfield, newfield)
 
 renameFieldTransformation :: Transformation (ClassName, FieldName, FieldName)
 renameFieldTransformation = Transformation
-  { tInputGen = renameFieldInputGen
+  { tInputGen = runMaybeT renameFieldInputGen
   , tPrecond = \(TransformationInput prog (cn, ofn, nfn)) -> isRight (renameFieldPrecondition prog cn ofn nfn)
   , tTrans = \(TransformationInput prog (cn, ofn, nfn)) -> either (const Nothing) Just $ renameField prog cn ofn nfn
   }
 
-extractSuperInputGen :: Gen (TransformationInput (ClassName, ClassName, ClassName))
+extractSuperInputGen :: MaybeT Gen (TransformationInput (ClassName, ClassName, ClassName))
 extractSuperInputGen = do
-  prog <- arbitrary `suchThat`
-                 (\(p :: Prog) ->
-                     isJust (makeCached p) &&
-                       any (\(c1, c2) -> superclass c1 == superclass c2)
-                           [(c1, c2) | c1 <- classes p, c2 <- classes p, className c1 /= className c2 ])
-  (c1,c2) <- elements [(c1, c2) | c1 <- classes prog, c2 <- classes prog, className c1 /= className c2]
-  csuper <- (Name . getReadable) <$> (arbitrary `suchThat` (\(Readable n) -> Name n `notElem` map className (classes prog)))
+  prog <- MaybeT $ arbitrary `suchThatMaybe`
+                        (\(p :: Prog) ->
+                          isJust (makeCached p) &&
+                            any (\(c1, c2) -> superclass c1 == superclass c2)
+                                [(c1, c2) | c1 <- classes p, c2 <- classes p, className c1 /= className c2 ])
+  (c1,c2) <- Trans.lift $ elements [(c1, c2) | c1 <- classes prog
+                                             , c2 <- classes prog
+                                             , className c1 /= className c2
+                                             , superclass c1 == superclass c2]
+  csuper <- (Name . getReadable) <$> (MaybeT $ arbitrary `suchThatMaybe` (\(Readable n) -> Name n `notElem` map className (classes prog)))
   return $ TransformationInput (fromJust . makeCached $ prog) (className c1, className c2, csuper)
 
 extractSuperTransformation :: Transformation (ClassName, ClassName, ClassName)
 extractSuperTransformation = Transformation
-  { tInputGen = extractSuperInputGen
+  { tInputGen = runMaybeT extractSuperInputGen
   , tPrecond = \(TransformationInput prog (cn1, cn2, cnsuper)) -> isRight (extractSuperPrecondition prog cn1 cn2 cnsuper)
   , tTrans = \(TransformationInput prog (cn1, cn2, cnsuper)) -> either (const Nothing) Just $ extractSuper prog cn1 cn2 cnsuper
   }
 
-replaceDelegationWithInheritanceInputGen :: Gen (TransformationInput (ClassName, FieldName))
+replaceDelegationWithInheritanceInputGen :: MaybeT Gen (TransformationInput (ClassName, FieldName))
 replaceDelegationWithInheritanceInputGen = do
-      prog <- arbitrary `suchThat`
-               (\(p :: Prog) ->
-                  let cp = makeCached p
-                  in isJust cp &&
-                       any (\c -> any
-                             (isRight . replaceDelegationWithInheritancePrecondition (fromJust cp) (className c) .
-                                            fieldName) (fields c)) (classes . cchProg $ fromJust cp))
+      prog <- MaybeT $ arbitrary `suchThatMaybe`
+                        (\(p :: Prog) ->
+                            let cp = makeCached p
+                            in isJust cp &&
+                                any (\c -> any
+                                      (isRight . replaceDelegationWithInheritancePrecondition (fromJust cp) (className c) .
+                                                      fieldName) (fields c)) (classes . cchProg $ fromJust cp))
       let Just cprog = makeCached prog
-      class' <- elements (filter
+      class' <- Trans.lift $ elements (filter
                             (\c -> any
                               (isRight . replaceDelegationWithInheritancePrecondition cprog (className c) .
                                   fieldName) (fields c)) (classes . cchProg $ cprog))
-      field <-  elements (filter (isRight . replaceDelegationWithInheritancePrecondition cprog (className class') .
+      field <-  Trans.lift $ elements (filter (isRight . replaceDelegationWithInheritancePrecondition cprog (className class') .
                                   fieldName) $ fields class')
       return $ TransformationInput cprog (className class', fieldName field)
 
 
 replaceDelegationWithInheritanceTransformation :: Transformation (ClassName, FieldName)
 replaceDelegationWithInheritanceTransformation = Transformation
-  { tInputGen = replaceDelegationWithInheritanceInputGen
+  { tInputGen = runMaybeT replaceDelegationWithInheritanceInputGen
   , tPrecond = \(TransformationInput prog (cn, fn)) ->
                   isRight (replaceDelegationWithInheritancePrecondition prog cn fn)
   , tTrans = \(TransformationInput prog (cn, fn)) ->
                    either (const Nothing) Just $ replaceDelegationWithInheritance prog cn fn
   }
 
+inputGenPrecondProperty :: Show a => Transformation a -> Property
+inputGenPrecondProperty tran =
+  forAll (tInputGen tran) (\minp -> isJust minp ==> tPrecond tran (fromJust minp))
+
 wellTypednessProperty :: Show a => Transformation a -> Property
 wellTypednessProperty tran =
   forAll (tInputGen tran) (\input ->
-    let progTy = checkTypes (tiProg input)
-    in isJust progTy ==>
-         let progOut = tTrans tran input { tiProg = fromJust progTy }
+    let progTy = checkTypes =<< (tiProg <$> input)
+    in isJust input && isJust progTy ==>
+         let progOut = tTrans tran (fromJust input) { tiProg = fromJust progTy }
          in isJust (checkTypes <$> (makeCached =<< (forgetTypeAnnotations <$> progOut))))
 
 wellTypednessPropertySC :: Transformation a -> (Prog, a) -> LSC.Property
