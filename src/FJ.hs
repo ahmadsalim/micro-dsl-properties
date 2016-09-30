@@ -574,7 +574,17 @@ data Transformation a = Transformation
 -- Properties
 
 renameFieldInputGen :: Gen (TransformationInput (ClassName, FieldName, FieldName))
-renameFieldInputGen = _
+renameFieldInputGen = do
+  prog <- arbitrary `suchThat`
+                      (\(p :: Prog) ->
+                         any (\cp -> any (\c -> not (null $ fields c)) (classes . cchProg $ cp))
+                                        (makeCached p))
+  let Just cp = makeCached prog
+  class' <- elements (filter (\c -> not (null $ fields c)) (classes . cchProg $ cp))
+  oldfield <- fieldName <$> elements (fields class')
+  newfield <- (Name . getReadable) <$> (arbitrary `suchThat` (\(Readable n) -> any (Name n `notElem`) $
+                                                               fmap (map fieldName) (fieldsOf cp (className class'))))
+  return $ TransformationInput cp (className class', oldfield, newfield)
 
 renameFieldTransformation :: Transformation (ClassName, FieldName, FieldName)
 renameFieldTransformation = Transformation
@@ -584,7 +594,15 @@ renameFieldTransformation = Transformation
   }
 
 extractSuperInputGen :: Gen (TransformationInput (ClassName, ClassName, ClassName))
-extractSuperInputGen = _
+extractSuperInputGen = do
+  prog <- arbitrary `suchThat`
+                 (\(p :: Prog) ->
+                     isJust (makeCached p) &&
+                       any (\(c1, c2) -> superclass c1 == superclass c2)
+                           [(c1, c2) | c1 <- classes p, c2 <- classes p, className c1 /= className c2 ])
+  (c1,c2) <- elements [(c1, c2) | c1 <- classes prog, c2 <- classes prog, className c1 /= className c2]
+  csuper <- (Name . getReadable) <$> (arbitrary `suchThat` (\(Readable n) -> Name n `notElem` map className (classes prog)))
+  return $ TransformationInput (fromJust . makeCached $ prog) (className c1, className c2, csuper)
 
 extractSuperTransformation :: Transformation (ClassName, ClassName, ClassName)
 extractSuperTransformation = Transformation
