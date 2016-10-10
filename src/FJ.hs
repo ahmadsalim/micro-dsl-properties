@@ -463,6 +463,8 @@ replaceDelegationWithInheritancePrecondition prog classnm fieldnm = do
     throwError $ "Class " ++ unName classnm ++ " already has a superclass " ++ unName (superclass class')
   field <- fromMaybe (throwError $ "Class " ++ unName classnm ++ " does not contain field " ++ unName fieldnm)
                      (return <$> find ((== fieldnm) . fieldName) (fields class'))
+  when (isSubtype prog (fieldType field) (className class')) $
+    throwError $ "Target type of field " ++ unName (fieldName field) ++ " must not be a subtype of target class" ++ unName (className class')
   return (class', field)
 
 replaceDelegationWithInheritance :: (MonadError String m) => CachedProg -> ClassName -> FieldName -> m Prog
