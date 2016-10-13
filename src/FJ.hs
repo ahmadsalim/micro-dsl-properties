@@ -237,7 +237,7 @@ genName = (Name . getReadable) <$> arbitrary
 
 genProgramTyped :: Int -> Gen (Maybe Prog)
 genProgramTyped size = do
-  classCount <- choose (1, (size + 1) `div` 5)
+  classCount <- choose (1, floor . sqrt . fromIntegral $ size)
   _objc:classesP1 <- reverse <$> foldrM (\_ prevClasses -> (:) <$> fmap (second Just) (genClassP1Typed (reverse prevClasses))
                                                                <*> pure prevClasses)
                      [(Name "Object", Nothing)] [0..classCount - 1]
@@ -256,7 +256,7 @@ genProgramTyped size = do
 
 genClassP1Typed :: [(ClassName, Maybe ClassName)] -> Gen (ClassName, ClassName)
 genClassP1Typed prevClasses = do
-  (super, _) <- elements prevClasses
+  super <- frequency $ fmap (\(c,_) -> (if unName c == "Object" then 1 else 5, return c)) prevClasses
   (,) <$> genName <*> pure super
 
 genClassP2Typed :: [(ClassName, [Field], [(MethodName, [ClassName], ClassName)], Maybe ClassName)] -> [(ClassName, ClassName)] -> (ClassName, ClassName) -> Int ->
@@ -264,10 +264,10 @@ genClassP2Typed :: [(ClassName, [Field], [(MethodName, [ClassName], ClassName)],
 genClassP2Typed prevClasses nextClasses (cn, scn) size  = do
   -- TODO figure out sizing and proportions
   let Just (_, superfs, superms, _) = find (\(nm,_,_,_) -> scn == nm) prevClasses
-  let allclasses = Name "Object" : map (\(nm,_,_,_) -> nm) prevClasses ++ map fst nextClasses
+  let allclasses = (1, return $ Name "Object") : fmap (\c -> (5, return c)) (map (\(nm,_,_,_) -> nm) prevClasses ++ [cn] ++ map fst nextClasses)
   (,,,) <$> pure cn
-        <*> ((superfs ++) <$> (nub <$> resize (size `div` 3) (listOf (Field <$> elements allclasses <*> genName))))
-        <*> ((superms ++) <$> (nub <$> resize (size `div` 3) (listOf ((,,) <$> genName <*> resize (size `div` 2) (listOf (elements allclasses)) <*> elements allclasses))))
+        <*> ((superfs ++) <$> (nub <$> resize (size `div` 3) (listOf (Field <$> frequency allclasses <*> genName))))
+        <*> ((superms ++) <$> (nub <$>  resize (size `div` 3) (listOf ((,,) <$> genName <*> resize (size `div` 4) (listOf (frequency allclasses)) <*> frequency allclasses))))
         <*> pure scn
 
 genClassTyped :: CachedProg -> [(ClassName, [Field], [(MethodName, [ClassName], ClassName)], ClassName)] -> Int -> Int -> Gen (Maybe Class)
@@ -787,10 +787,10 @@ wellTypednessPropertySC tran (prog, aux) =
 
 -- Sampling from Generators
 
-sampleScoped :: IO ()
-sampleScoped = do
-  vs <- sample' (arbitrary :: Gen Prog)
-  let welltyped = filter (\v -> isJust (makeCached v >>= checkTypes)) vs
+sampleProgGen :: Gen (Maybe Prog) -> IO ()
+sampleProgGen progGen = do
+  vs <- sample' progGen
+  let welltyped = filter (\v -> isJust (v >>= makeCached >>= checkTypes)) vs
   mapM_ (putStrLn . (++ "\n\n\n------------------------------") . show)
     welltyped
   putStrLn ("Generated program count total: " ++ show (length vs) ++ "\n" ++ "Generated program count well-typed: " ++ show (length welltyped))
