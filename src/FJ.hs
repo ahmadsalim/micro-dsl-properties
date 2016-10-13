@@ -22,6 +22,7 @@ import Control.Monad
 import Control.Monad.Except
 import Control.Monad.Trans.Class as Trans
 import Control.Monad.Trans.Maybe
+import Control.Arrow (second)
 
 import Text.PrettyPrint
 
@@ -151,7 +152,7 @@ updateCachedProg cprog class' =
   in if |  Just supersuperty <- Map.lookup (superclass class') supertypes
          , Just superFields  <- Map.lookup (superclass class') allFields
          , Just superMethods <- Map.lookup (superclass class') allMethods ->
-                return cprog {
+              return cprog {
                   cchProg = prog { classes = class' : classes prog }
                 , cchSupertypes = Map.insert (className class') (
                     superclass class' : supersuperty) supertypes
@@ -169,14 +170,16 @@ emptyCachedProg =  CachedProg (Prog []) (Map.singleton (Name "Object") [])
 
 makeCached :: Prog -> Maybe CachedProg
 makeCached prog =
-  let classKeyMap :: Map ClassName (Class, Int) = Map.fromList $ zipWith (\(cn, c) k -> (cn, (c, k))) (map (\c -> (className c, c)) $ classes prog) [1..]
-      (g,vm) = Graph.graphFromEdges' $ map (\(cn, (c, k)) -> (c, k, toList (snd <$> Map.lookup (superclass c) classKeyMap)))
+  let classKeyMap = Map.fromList $
+        zipWith (\(cn, c) k -> (cn, (c, k))) (map (\c -> (className c, c)) $ classes prog) [1..]
+      (g,vm) = Graph.graphFromEdges' $ map (\(cn, (c, k)) ->
+                                              (c, k, toList (snd <$> Map.lookup (superclass c) classKeyMap)))
                                            (Map.toList classKeyMap)
   in foldlM updateCachedProg emptyCachedProg . map ((\(c,_,_) -> c) . vm) $ reverse $ Graph.topSort g
 
-genProgram :: Int -> Gen Prog
-genProgram size = do
-  cnames <- nub <$> resize (size `div` 2) (listOf1 ((Name . getReadable) <$> arbitrary))
+genProgramScoped :: Int -> Gen Prog
+genProgramScoped size = do
+  cnames <- nub <$> resize (size `div` 2) (listOf1 genName)
   _objc : cs <- reverse <$> foldrM (\cn gp1 -> (: gp1) <$>
                                 ((\(c,fs,ms,sp) -> (c,fs,ms,Just sp)) <$> genClassP1Scoped gp1 cn (size `div` length cnames)))
                                  [(Name "Object", [], [], Nothing)] cnames
@@ -187,14 +190,14 @@ genProgram size = do
          emptyCachedProg [0 .. length cs' - 1]
 
 instance Arbitrary Prog where
-  arbitrary = sized genProgram
+  arbitrary = sized genProgramScoped
 
 genClassP1Scoped :: [(ClassName, [FieldName], [(MethodName, Int)], Maybe ClassName)] -> ClassName -> Int -> Gen (ClassName, [FieldName], [(MethodName, Int)], ClassName)
 genClassP1Scoped prevClasses cn size = do
   (super, superfs, superms, _) <- elements prevClasses
   (,,,) <$> pure cn
-        <*> ((superfs ++) <$> (nub <$> resize (size `div` 2) (listOf ((Name . getReadable) <$> arbitrary))))
-        <*> ((superms ++) <$> (nub <$> resize (size `div` 2) (listOf ((,) <$> ((Name . getReadable) <$> arbitrary) <*> ((getSmall . getPositive) <$> arbitrary)))))
+        <*> ((superfs ++) <$> (nub <$> resize (size `div` 2) (listOf genName)))
+        <*> ((superms ++) <$> (nub <$> resize (size `div` 2) (listOf ((,) <$> genName <*> ((getSmall . getPositive) <$> arbitrary)))))
         <*> pure super
 
 genClassScoped :: CachedProg -> [(ClassName, [FieldName], [(MethodName, Int)], ClassName)] -> Int -> Int -> Gen Class
@@ -215,7 +218,7 @@ genFieldScoped classes fn = Field <$> elements classes <*> pure fn
 genMethodScoped :: [(ClassName, Int)] -> [FieldName] -> [(MethodName, Int)] -> (MethodName, Int) -> Int -> Gen Method
 genMethodScoped classes fields methods (methodnm, argcount) size = do
     params <- zip <$> vectorOf argcount (fst <$> elements classes)
-                  <*> (vectorOf argcount ((Name . getReadable) <$> arbitrary) `suchThat` unique)
+                  <*> (vectorOf argcount genName `suchThat` unique)
     Method <$> (fst <$> elements classes) <*> pure methodnm <*> pure params
            <*> genExprScoped classes fields methods (map snd params ++ [Name "this"]) size
 
@@ -229,6 +232,116 @@ genExprScoped classes fields methods env = go
                                 New Nothing <$> pure c <*> vectorOf argcount (go (size `div` (argcount + 1))) | not (null classes) && size > 0 ] ++
                            [ Cast Nothing <$> (fst <$> elements classes) <*> go (size - 1) | not (null classes) && size > 0 ]
 
+genName :: Gen Name
+genName = (Name . getReadable) <$> arbitrary
+
+genProgramTyped :: Int -> Gen (Maybe Prog)
+genProgramTyped size = do
+  classCount <- choose (1, (size + 1) `div` 5)
+  _objc:classesP1 <- reverse <$> foldrM (\_ prevClasses -> (:) <$> fmap (second Just) (genClassP1Typed (reverse prevClasses))
+                                                               <*> pure prevClasses)
+                     [(Name "Object", Nothing)] [0..classCount - 1]
+  let size' = (max 0 $ size - classCount) `div` classCount
+  let classesP1' = map (\(cn, Just scn) -> (cn,scn)) classesP1
+  _objc:classesP2 <- (reverse . fst) <$> foldlM (\(prevClasses, _:nextClasses) cp1 ->
+                         (,) <$> ((:) <$> ((\(cn,fs,ms,scn) -> (cn,fs,ms,Just scn)) <$>
+                                  genClassP2Typed (reverse prevClasses) nextClasses cp1 size') <*> pure prevClasses)
+                             <*> pure nextClasses) ([(Name "Object", [], [], Nothing)], classesP1') classesP1'
+  let classesP2' = fmap (\(cn,fs,ms, Just scn) -> (cn,fs,ms,scn)) classesP2
+  (cchProg <$>) <$> runMaybeT (foldlM (\prevProg ci ->
+                          (fromJust . updateCachedProg prevProg) <$>
+                            MaybeT (genClassTyped prevProg classesP2' ci (size' `div` 2)))
+                              emptyCachedProg [0 .. length classesP2' - 1])
+
+
+genClassP1Typed :: [(ClassName, Maybe ClassName)] -> Gen (ClassName, ClassName)
+genClassP1Typed prevClasses = do
+  (super, _) <- elements prevClasses
+  (,) <$> genName <*> pure super
+
+genClassP2Typed :: [(ClassName, [Field], [(MethodName, [ClassName], ClassName)], Maybe ClassName)] -> [(ClassName, ClassName)] -> (ClassName, ClassName) -> Int ->
+                    Gen (ClassName, [Field], [(MethodName, [ClassName], ClassName)], ClassName)
+genClassP2Typed prevClasses nextClasses (cn, scn) size  = do
+  -- TODO figure out sizing and proportions
+  let Just (_, superfs, superms, _) = find (\(nm,_,_,_) -> scn == nm) prevClasses
+  let allclasses = Name "Object" : map (\(nm,_,_,_) -> nm) prevClasses ++ map fst nextClasses
+  (,,,) <$> pure cn
+        <*> ((superfs ++) <$> (nub <$> resize (size `div` 3) (listOf (Field <$> elements allclasses <*> genName))))
+        <*> ((superms ++) <$> (nub <$> resize (size `div` 3) (listOf ((,,) <$> genName <*> resize (size `div` 2) (listOf (elements allclasses)) <*> elements allclasses))))
+        <*> pure scn
+
+genClassTyped :: CachedProg -> [(ClassName, [Field], [(MethodName, [ClassName], ClassName)], ClassName)] -> Int -> Int -> Gen (Maybe Class)
+genClassTyped prevProg classes index size = runMaybeT $ do
+  let (cn, fs, ms, sn) = classes !! index
+  let cms = map (\(mn, atys, rty) -> (cn, mn, atys, rty)) ms
+  let supertypes = foldl' (\prevSupers (c,_,_,sc)  ->
+                            let Just scsupers = Map.lookup sc prevSupers
+                            in  Map.insert c (sc:scsupers) prevSupers) (Map.singleton (Name "Object") []) classes
+  let allcs = map (\(c,fs,_,_) -> (c, map fieldName fs)) classes
+  let allfs = concatMap (\(c,fs,_,_) -> map (\f -> (c, fieldName f, fieldType f)) fs) classes
+  let allms = concatMap (\(c,_,ms,_) -> map (\(mn, atys, rty) -> (c, mn, atys, rty)) ms) classes
+  let Just sfvals = fieldsOf prevProg sn
+  let specificfs = fs \\ sfvals
+  Class cn sn specificfs (Constructor fs sfvals) <$>
+    mapM (\m -> MaybeT $ genMethodTyped supertypes allcs allfs allms m ((max 0 $ size - length specificfs) `div` length cms)) cms
+
+genMethodTyped :: Map ClassName [ClassName] -> [(ClassName, [ClassName])] -> [(ClassName, FieldName, ClassName)] -> [(ClassName, MethodName, [ClassName], ClassName)] -> (ClassName, MethodName, [ClassName], ClassName) -> Int -> Gen (Maybe Method)
+genMethodTyped supertypes constructors fields methods (mclass, methodnm, argtys, retty) size = runMaybeT $ do
+    params <- Trans.lift (zip argtys <$> (vectorOf (length argtys) ((Name . getReadable) <$> arbitrary) `suchThat` unique))
+    body <- MaybeT (join <$> (genExprTyped supertypes constructors fields methods (params ++ [(mclass, Name "this")]) Nothing retty size `suchThatMaybe` isJust)) -- Try with some backtracking
+    return $ Method retty methodnm params body
+
+genExprTyped :: Map ClassName [ClassName] -> [(ClassName, [ClassName])] -> [(ClassName, FieldName, ClassName)] -> [(ClassName, MethodName, [ClassName], ClassName)] -> [(ClassName, Name)] -> Maybe ClassName -> ClassName -> Int -> Gen (Maybe Expr)
+genExprTyped supertypes constructors fields methods env = go
+  where go :: Maybe ClassName -> ClassName -> Int -> Gen (Maybe Expr)
+        go targetSubType targetSuperType size =
+            if not (null possibleValues) then
+              oneof possibleValues
+            else return Nothing
+          where possibleValues = [(Just . Var Nothing . snd) <$> elements possibleVars | not (null possibleVars)] ++
+                                 [runMaybeT $ do
+                                       (tty, fnm, _fty) <- Trans.lift $ elements possibleFields
+                                       texpr <- MaybeT $ go Nothing tty (size - 1)
+                                       return $ FieldAccess Nothing texpr fnm
+                                     | not (null possibleFields) && size > 0 ] ++
+                                 [runMaybeT $ do
+                                       (tty, mnm, atys, _retty) <- Trans.lift $ elements possibleMethods
+                                       let size' = size `div` (length atys + 1)
+                                       texpr <- MaybeT $ go Nothing tty size'
+                                       aexprs <- mapM (MaybeT . flip (go Nothing) size') atys
+                                       return $ MethodCall Nothing texpr mnm aexprs
+                                     | not (null possibleMethods) && size > 0] ++
+                                 [runMaybeT $ do
+                                       (tty, atys) <- Trans.lift $ elements possibleConstructors
+                                       let size' = size `div` length atys
+                                       aexprs <- mapM (MaybeT . flip (go Nothing) size') atys
+                                       return $ New Nothing tty aexprs
+                                     | not (null possibleConstructors) && size > 0] ++
+                                 [runMaybeT $ do
+                                       castTy <- MaybeT $ genType supertypes targetSubType targetSuperType
+                                       castExpr <- MaybeT $ go Nothing castTy (size - 1)
+                                       return $ Cast Nothing castTy castExpr
+                                     | size > 0] ++
+                                 [runMaybeT $ do
+                                       castTy <- MaybeT $ genType supertypes targetSubType targetSuperType
+                                       castExpr <- MaybeT $ go (Just castTy) (Name "Object") (size - 1)
+                                       return $ Cast Nothing castTy castExpr
+                                     | size > 0]
+                possibleConstructors = filter (\(ty, _argtys) -> withinBounds ty) constructors
+                possibleFields = filter (\(_ety, _fn, fty) -> withinBounds fty) fields
+                possibleMethods = filter (\(_ety, _mn, _argtys, retty) -> withinBounds retty) methods
+                possibleVars = filter (\(xty, _xn) -> withinBounds xty) env
+                withinBounds ty =
+                  any (targetSuperType `elem`) ((ty :) <$> Map.lookup ty supertypes) &&
+                      all (\subty -> any (ty `elem`) ((subty :) <$> Map.lookup subty supertypes)) targetSubType
+
+genType :: Map ClassName [ClassName] -> Maybe ClassName -> ClassName -> Gen (Maybe ClassName)
+genType supertypes lty hty =
+    if not (null possibletys) then
+      Just <$> elements possibletys
+    else return Nothing
+  where hsubtys = Map.keys $ Map.filter (hty `elem`) supertypes
+        possibletys = filter (\hsty -> all (hsty `elem`) (lty >>= (`Map.lookup` supertypes))) hsubtys
 -- Checking
 
 infixr 6 :=>:
