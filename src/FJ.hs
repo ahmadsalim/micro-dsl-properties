@@ -422,7 +422,7 @@ typeExpression prog env (New Nothing cn es) = do
 typeExpression prog env (Cast Nothing tc e) = do
   (_ety, e') <- typeExpression prog env e
   return {-
-    Aif not (isSubtype prog ety tc) && not (isSubtype prog tc ety)
+    if not (isSubtype prog ety tc) && not (isSubtype prog tc ety)
     then tc {- STUPID WARNING -}
     else -} (tc, Cast (Just tc) tc e')
 typeExpression _prog _env _ = Nothing
