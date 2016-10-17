@@ -1,6 +1,5 @@
-{-# LANGUAGE ScopedTypeVariables, MultiParamTypeClasses, FlexibleContexts, MultiWayIf, TypeOperators #-}
+{-# LANGUAGE ScopedTypeVariables, MultiParamTypeClasses, FlexibleContexts, MultiWayIf, TypeOperators, DeriveDataTypeable #-}
 {-# OPTIONS_GHC -fwarn-incomplete-patterns #-}
-{-# OPTIONS_GHC -F -pgmFderive -optF-F #-}
 module FJ where
 
 import Data.Data
@@ -15,7 +14,7 @@ import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import qualified Data.Graph as Graph
 
-import Data.Generics.Uniplate.Direct
+import Data.Generics.Uniplate.Data
 
 import Control.Applicative
 import Control.Monad
@@ -32,14 +31,14 @@ import qualified Test.LazySmallCheck as LSC
 type f $ a = f a
 
 newtype Name = Name { unName :: String }
-  deriving (Show, Eq, Ord)
+  deriving (Show, Eq, Ord, Data, Typeable)
 
 type ClassName  = Name
 type FieldName  = Name
 type MethodName = Name
 
 newtype Prog = Prog { classes :: [Class] }
-  deriving Eq
+  deriving (Eq, Data, Typeable)
 
 instance Show Prog where
   show = render . prettyProg
@@ -59,19 +58,19 @@ data Class = Class
             , constructor :: Constructor
             , methods :: [Method]
             }
-   deriving (Show, Eq)
+   deriving (Show, Eq, Data, Typeable)
 
 data Field = Field
              { fieldType :: ClassName
              , fieldName  :: Name
              }
-  deriving (Show, Eq)
+  deriving (Show, Eq, Data, Typeable)
 
 data Constructor = Constructor
                    { constructorArguments       :: [Field]
                    , constructorSuperArguments  :: [Field]
                    }
-  deriving (Show, Eq)
+  deriving (Show, Eq, Data, Typeable)
 
 data Method = Method
               { methodReturnType :: ClassName
@@ -79,30 +78,14 @@ data Method = Method
               , methodParameters :: [(ClassName, Name)]
               , methodBodyExpr   :: Expr
               }
-  deriving (Show, Eq)
+  deriving (Show, Eq, Data, Typeable)
 
 data Expr = Var         { exprType :: Maybe ClassName, varName :: Name }
           | FieldAccess { exprType :: Maybe ClassName, fieldAccessTarget :: Expr, fieldAccessName :: FieldName }
           | MethodCall  { exprType :: Maybe ClassName, methodCallTarget :: Expr, methodCallName :: MethodName, methodCallArgs :: [Expr] }
           | New         { exprType :: Maybe ClassName, newInstanceClassName :: ClassName, newInstanceArgs :: [Expr] }
           | Cast        { exprType :: Maybe ClassName, castClassName :: ClassName, castTarget :: Expr }
-  deriving (Show, Eq)
-
-{-!
-deriving instance UniplateDirect Prog   Class
-deriving instance UniplateDirect Prog   Expr
-deriving instance UniplateDirect Prog
-deriving instance UniplateDirect Constructor Field
-deriving instance UniplateDirect Constructor
-deriving instance UniplateDirect Class
-deriving instance UniplateDirect Class  Expr
-deriving instance UniplateDirect Class  Field
-deriving instance UniplateDirect Field
-deriving instance UniplateDirect Class  Method
-deriving instance UniplateDirect Method
-deriving instance UniplateDirect Method Expr
-deriving instance UniplateDirect Expr
-!-}
+  deriving (Show, Eq, Data, Typeable)
 
 -- Serial
 
@@ -188,9 +171,6 @@ genProgramScoped size = do
                         (fromJust . updateCachedProg prevProg) <$>
                           genClassScoped prevProg cs' ci (size `div` length cs'))
          emptyCachedProg [0 .. length cs' - 1]
-
-instance Arbitrary Prog where
-  arbitrary = sized genProgramScoped
 
 genClassP1Scoped :: [(ClassName, [FieldName], [(MethodName, Int)], Maybe ClassName)] -> ClassName -> Int -> Gen (ClassName, [FieldName], [(MethodName, Int)], ClassName)
 genClassP1Scoped prevClasses cn size = do
@@ -692,12 +672,12 @@ data Transformation a = Transformation
 
 -- Properties
 
-renameFieldInputGen :: MaybeT Gen (TransformationInput (ClassName, FieldName, FieldName))
-renameFieldInputGen = do
-  prog <- MaybeT $ arbitrary `suchThatMaybe`
-                      (\(p :: Prog) ->
-                         any (\cp -> any (\c -> not (null $ fields c)) (classes . cchProg $ cp))
-                                        (makeCached p))
+renameFieldInputGen :: Gen (Maybe Prog) -> MaybeT Gen (TransformationInput (ClassName, FieldName, FieldName))
+renameFieldInputGen progGen = do
+  prog <- MaybeT . fmap join $ progGen `suchThatMaybe`
+                      (\(pM :: Maybe Prog) ->
+                         any (\p -> any (\cp -> any (\c -> not (null $ fields c)) (classes . cchProg $ cp))
+                                        (makeCached p)) pM)
   let Just cp = makeCached prog
   class' <- Trans.lift $ elements (filter (\c -> not (null $ fields c)) (classes . cchProg $ cp))
   oldfield <- Trans.lift (fieldName <$> elements (fields class'))
@@ -707,18 +687,19 @@ renameFieldInputGen = do
 
 renameFieldTransformation :: Transformation (ClassName, FieldName, FieldName)
 renameFieldTransformation = Transformation
-  { tInputGen = runMaybeT renameFieldInputGen
+  { tInputGen = runMaybeT $ renameFieldInputGen (sized genProgramTyped)
   , tPrecond = \(TransformationInput prog (cn, ofn, nfn)) -> isRight (renameFieldPrecondition prog cn ofn nfn)
   , tTrans = \(TransformationInput prog (cn, ofn, nfn)) -> either (const Nothing) Just $ renameField prog cn ofn nfn
   }
 
-extractSuperInputGen :: MaybeT Gen (TransformationInput (ClassName, ClassName, ClassName))
-extractSuperInputGen = do
-  prog <- MaybeT $ arbitrary `suchThatMaybe`
-                        (\(p :: Prog) ->
-                          isJust (makeCached p) &&
-                            any (\(c1, c2) -> superclass c1 == superclass c2)
-                                [(c1, c2) | c1 <- classes p, c2 <- classes p, className c1 /= className c2 ])
+extractSuperInputGen :: Gen (Maybe Prog) -> MaybeT Gen (TransformationInput (ClassName, ClassName, ClassName))
+extractSuperInputGen progGen = do
+  prog <- MaybeT . fmap join $ progGen `suchThatMaybe`
+                        (\(pM :: Maybe Prog) ->
+                           any (\p ->
+                            isJust (makeCached p) &&
+                              any (\(c1, c2) -> superclass c1 == superclass c2)
+                                  [(c1, c2) | c1 <- classes p, c2 <- classes p, className c1 /= className c2 ]) pM)
   (c1,c2) <- Trans.lift $ elements [(c1, c2) | c1 <- classes prog
                                              , c2 <- classes prog
                                              , className c1 /= className c2
@@ -728,20 +709,21 @@ extractSuperInputGen = do
 
 extractSuperTransformation :: Transformation (ClassName, ClassName, ClassName)
 extractSuperTransformation = Transformation
-  { tInputGen = runMaybeT extractSuperInputGen
+  { tInputGen = runMaybeT $ extractSuperInputGen (sized genProgramTyped)
   , tPrecond = \(TransformationInput prog (cn1, cn2, cnsuper)) -> isRight (extractSuperPrecondition prog cn1 cn2 cnsuper)
   , tTrans = \(TransformationInput prog (cn1, cn2, cnsuper)) -> either (const Nothing) Just $ extractSuper prog cn1 cn2 cnsuper
   }
 
-replaceDelegationWithInheritanceInputGen :: MaybeT Gen (TransformationInput (ClassName, FieldName))
-replaceDelegationWithInheritanceInputGen = do
-      prog <- MaybeT $ arbitrary `suchThatMaybe`
-                        (\(p :: Prog) ->
+replaceDelegationWithInheritanceInputGen :: Gen (Maybe Prog) -> MaybeT Gen (TransformationInput (ClassName, FieldName))
+replaceDelegationWithInheritanceInputGen progGen = do
+      prog <- MaybeT . fmap join $ progGen `suchThatMaybe`
+                        (\(pM :: Maybe Prog) ->
+                           any (\p ->
                             let cp = makeCached p
                             in isJust cp &&
                                 any (\c -> any
                                       (isRight . replaceDelegationWithInheritancePrecondition (fromJust cp) (className c) .
-                                                      fieldName) (fields c)) (classes . cchProg $ fromJust cp))
+                                                      fieldName) (fields c)) (classes . cchProg $ fromJust cp)) pM)
       let Just cprog = makeCached prog
       class' <- Trans.lift $ elements (filter
                             (\c -> any
@@ -754,7 +736,7 @@ replaceDelegationWithInheritanceInputGen = do
 
 replaceDelegationWithInheritanceTransformation :: Transformation (ClassName, FieldName)
 replaceDelegationWithInheritanceTransformation = Transformation
-  { tInputGen = runMaybeT replaceDelegationWithInheritanceInputGen
+  { tInputGen = runMaybeT $ replaceDelegationWithInheritanceInputGen (sized genProgramTyped)
   , tPrecond = \(TransformationInput prog (cn, fn)) ->
                   isRight (replaceDelegationWithInheritancePrecondition prog cn fn)
   , tTrans = \(TransformationInput prog (cn, fn)) ->
